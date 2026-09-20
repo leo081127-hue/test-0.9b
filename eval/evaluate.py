@@ -45,6 +45,7 @@ def run_model_eval(args, rows: list[dict]):
     model.eval()
 
     llm_p, llm_y, llm_cov_p, llm_cov_y, llm_pred_ok = [], [], [], [], []
+    llm_rows: list[dict] = []  # 每筆解析成功的:match_id + p_home(分季統計用)
     n_err = 0
     for k, row in enumerate(rows):
         text = tok.apply_chat_template(row["prompt"], tokenize=False, add_generation_prompt=True)
@@ -62,6 +63,7 @@ def run_model_eval(args, rows: list[dict]):
             continue
         llm_p.append(p["p_home"])
         llm_y.append(row["outcome_home"])
+        llm_rows.append({"match_id": row["match_id"], "p_home": p["p_home"]})
         if p["cover_home"] is not None:
             llm_cov_p.append(p["cover_home"])
             llm_cov_y.append(row["cover_home"])
@@ -79,7 +81,7 @@ def run_model_eval(args, rows: list[dict]):
             (((np.asarray(llm_cov_p) >= 0.5).astype(float)) ==
              (np.asarray(llm_cov_y) == 1)).mean()
         )
-    return m, llm_p, llm_y
+    return m, llm_p, llm_y, llm_rows
 
 
 def main() -> None:
@@ -106,10 +108,10 @@ def main() -> None:
     print(f"test rows: {len(rows)}")
 
     report = {"model_id": args.model_id, "adapter_dir": args.adapter_dir, "n_test": len(rows)}
-    llm_p, llm_y = None, None
+    llm_p, llm_y, llm_rows = None, None, None
 
     if not args.no_model:
-        report["LLM"], llm_p, llm_y = run_model_eval(args, rows)
+        report["LLM"], llm_p, llm_y, llm_rows = run_model_eval(args, rows)
     else:
         report["LLM"] = None
 
@@ -140,6 +142,27 @@ def main() -> None:
     coin["ece"] = ece(np.full(len(ym), 0.5), ym)
     report["Coin"] = coin
 
+    # ---- 分季統計(看模型在更晚賽季是否退化)----
+    if "season" in df.columns:
+        season_of = dict(zip(df["match_id"], df["season"]))
+        outcome_of = dict(zip(df["match_id"], df["home_win"].astype(int)))
+        by_season: dict = {}
+        for s in sorted(set(season_of.values())):
+            mids = {m for m, se in season_of.items() if se == s}
+            entry: dict = {}
+            if llm_rows:
+                sel = [r for r in llm_rows if r["match_id"] in mids]
+                if sel:
+                    entry["LLM"] = _acc_brier_logloss(
+                        [r["p_home"] for r in sel], [outcome_of[r["match_id"]] for r in sel])
+            mt = tm[tm["match_id"].isin(mids)]
+            if len(mt) > 0:
+                mp = np.array([implied_prob(r.close_ml_home, r.close_ml_away)[0] for r in mt.itertuples()])
+                entry["Market"] = _acc_brier_logloss(mp, mt["home_win"].astype(int).values)
+            if entry:
+                by_season[s] = entry
+        report["by_season"] = by_season
+
     # ---- 輸出 ----
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:
@@ -157,6 +180,13 @@ def main() -> None:
         if name == "LLM":
             extra = f"pred_acc={fmt(m.get('pred_acc'), 3)} cover_acc={fmt(m.get('cover_acc'), 3)} parse_err={fmt(m['parse_error_rate'], 3)}"
         print(f"{name:<14}{fmt(m['acc'], 3):>7}{fmt(m['brier']):>9}{fmt(m['logloss']):>10}{fmt(m['ece']):>8}  {extra}")
+    if report.get("by_season"):
+        print(f"\n{'season':<12}{'model':<10}{'acc':>7}{'brier':>9}{'n':>6}")
+        for s, entry in report["by_season"].items():
+            for name in ("LLM", "Market"):
+                if name in entry:
+                    m = entry[name]
+                    print(f"{s:<12}{name:<10}{fmt(m['acc'], 3):>7}{fmt(m['brier']):>9}{m['n']:>6}")
     print(f"\nreport -> {args.report}")
 
     if args.plot:

@@ -33,8 +33,9 @@
 2. **0.9B 的價值在哪?** ① 便宜快(單張消费級 GPU 就能微調);② 可解釋——每筆預測附推理;
    ③ 能透過「teacher 蒸餾 + RL」吸收盤口特徵 → 機率 的非線性模式;④ K2-Horizon 本身就是
    RL(GRPO)訓練出來的 reasoning 模型,接續 RL 階段最順。
-3. **demo 合成資料裡故意放了 12% 的「盤口誤價」**,所以 demo 上模型會「贏過市場」——
-   那只是驗證管線用,換上你的真實資料後,成績對照市場基準才有意義。
+3. **demo 合成資料裡故意放了 ~25% 的「盤口誤價」與盤口看不到的休息天數效應**,
+   所以 demo 上模型會「贏過市場」——那只是驗證管線用,換上你的真實資料後,
+   成績對照市場基準才有意義(真實市場的漏洞通常少得多,甚至沒有)。
 
 ## 2. 基座模型選擇
 
@@ -122,8 +123,18 @@ bash scripts/smoke_test.sh
 - 你的「enhance RL」需求就放在這:體育預測有**可驗證的 reward**(結果出來就知道準不準),
   正適合 on-policy RL。reward = 格式分 + 勝率 Brier + 方向分 + 讓分覆蓋 Brier(權重 0.3)。
 - 這與 K2-Horizon 自己的訓練路線一致(它的 math/code 專家都是 GRPO 練出來再 merge)。
-- 需 `pip install trl`;0.9B + `--num-generations 8` 建議 24GB 顯存。
-- ⚠️ TRL API 版本間變動快,腳本以 0.11+ 風格撰寫,報錯時對照你所裝版本的範例微調。
+- 需 `pip install trl datasets`;腳本已對 **TRL 1.x 的 GRPOTrainer API 實跑驗證**
+  (reward 函數簽名、`datasets.Dataset`、batch 整除限制)。
+- ⚠️ TRL 1.x 要求 `--batch-size` 能被 `--num-generations` 整除(如 8×2、16×8)。
+- 0.9B + `--num-generations 8` 建議 24GB 顯存;8GB 用 `--num-generations 2 --batch-size 2`。
+
+### 部署:`tools/merge_adapter.py`
+把 LoRA 合併進基座 → 標準 HF 目錄,直接給 vLLM/SGLang 用:
+```bash
+python tools/merge_adapter.py --model-id "$MODEL_ID" $EXTRA_ARGS \
+    --adapter-dir output/dpo --out-dir output/dpo_merged
+vllm serve output/dpo_merged --trust-remote-code --dtype bfloat16 --reasoning-parser k2_horizon
+```
 
 ## 7. 評估指標(`eval/evaluate.py`)
 
@@ -137,7 +148,9 @@ bash scripts/smoke_test.sh
 | parse_error_rate | 格式解析失敗率 | 應該 <2%,否則調 `--max-new-tokens` 或重訓 |
 
 `report.json` 會同時給 **LLM / Market close / LogReg / Coin** 四組數字——
-**LLM 的 brier 要贏過 Market close 才算有意義**。`calibration.png` 畫三者的校準曲線。
+**LLM 的 brier 要贏過 Market close 才算有意義**。`calibration.png` 畫校準曲線。
+另外 `report["by_season"]` 給**分季** LLM vs Market 的 acc/brier,看模型在更晚的賽季
+(時間外推)是否退化——體育模型最怕這個。
 
 ## 8. 故障排除
 
@@ -146,6 +159,8 @@ bash scripts/smoke_test.sh
 | `trust_remote_code` 載入失敗(K2-Horizon) | 確認 `transformers>=4.44`、PyTorch 2.x;該模型官方建議 bf16(`--dtype bfloat16`,預設就是) |
 | OOM | `--grad-ckpt`、降 `--batch-size`/`--grad-accum`、DPO 用 4bit reference(目前用 disable-adapter 技巧,已省一份 VRAM) |
 | parse_error_rate 高 | 調大 `--max-new-tokens`(預設 384)、確認用對 adapter;推理用 `temperature=0` |
+| GRPO 報 `generation_batch_size ... divisible by num_generations` | TRL 1.x 限制:`--batch-size` 要能被 `--num-generations` 整除(如 2/2、8/8、16/8) |
+| GRPO 報 `train_dataset must be a Dataset` | 腳本已用 `datasets.Dataset.from_list`;若改動資料輸入,記得保持該轉換 |
 | val loss 下降但 test 贏不了 market | 正常!檢查是否資料太少/盤口品質差;先確認 LogReg baseline 本身能否贏 market(它贏不了,LLM 更難) |
 | 想加速推論 | vLLM serve(見 K2-Horizon model card 的 quickstart),adapter 合併後部署 |
 
@@ -162,14 +177,32 @@ train/
   sft.py                     # LoRA SFT(主)
   dpo.py                     # DPO(選用)
   grpo.py                    # GRPO RL(選用,需 trl)
-eval/evaluate.py             # 評估 + baseline 對照 + report.json + calibration.png
+eval/evaluate.py             # 評估 + baseline 對照 + 分季統計 + report.json + calibration.png
 infer/predict.py             # 單筆預測 CLI
 tools/smoke_tiny_model.py    # 本地 tiny 模型(無網路 smoke test 用)
+tools/merge_adapter.py       # LoRA 合併進基座 → vLLM/SGLang 部署
+tests/                       # pytest:單元 + 資料不變量 + 全管線整合(無網路無 GPU 可跑)
 scripts/run_all.sh           # 一條龍(GPU 機器)
 scripts/smoke_test.sh        # CPU smoke(無 GPU 也能跑)
+.github/workflows/ci.yml     # CI:push/PR 自動跑全部測試
 ```
 
-## 10. 免責
+## 10. 測試
+
+```bash
+pip install -r requirements-dev.txt
+python -m pytest tests/ -q          # 全部(含整合管線,2 核 CPU 約 4~5 分鐘)
+python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 15 秒)
+```
+
+覆蓋:
+- `test_common.py` — prompt/回應格式、解析(含全形符號、未加和為 1 的正規化)、Brier/LogLoss/ECE、特徵矩陣
+- `test_generate.py` — 生成器確定性、時間序列不變量、**近10場/對決特徵不用未來資料**、盤口區隔度(AUC>0.6)
+- `test_build_dataset.py` — 時間切分無反序、jsonl schema、回應機率 == teacher 值、DPO pairs 方向扭曲
+- `test_dpo_ref.py` — DPO 的「disable adapter == base」reference 技巧的數值正確性
+- `test_pipeline.py` — 整合:generate→build→tiny→SFT(含 val)→DPO→**GRPO**→評估→推論→**merge 部署**
+
+## 11. 免責
 
 本專案僅供**學習與研究**。體育賠率由持牌機構提供,任何預測都不保證獲利;
 請遵守所在地法律,不要把它當成投注建議。

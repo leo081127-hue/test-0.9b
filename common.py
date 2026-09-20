@@ -107,7 +107,7 @@ def build_response(p_home: float, cover_home: float, reasons: List[str]) -> str:
     )
 
 
-_NUM = r"(?:1(?:\.0*)?|0(?:\.\d+)?)"
+_NUM = r"(1(?:\.0+)?|0(?:\.\d+)?)"
 RE_PRED = re.compile(r"最終預測[:：]\s*(主隊|客隊)")
 RE_WINPROB = re.compile(r"機率[:：]\s*主隊\s*" + _NUM + r"\s*[,，]\s*客隊\s*" + _NUM)
 RE_COVER = re.compile(r"讓分覆蓋[:：]\s*主隊\s*" + _NUM + r"\s*[,，]\s*客隊\s*" + _NUM)

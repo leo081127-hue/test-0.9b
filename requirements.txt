@@ -10,5 +10,6 @@ transformers>=4.44
 peft>=0.12
 accelerate>=0.30
 
-# ---- 選用:GRPO(RL)階段, train/grpo.py ----
-# trl>=0.12
+# ---- 選用:GRPO(RL)階段, train/grpo.py(已對 trl 1.x 驗證)----
+# trl>=1.0
+# datasets>=3.0

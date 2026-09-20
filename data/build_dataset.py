@@ -96,7 +96,8 @@ def main() -> None:
     y_win = train["home_win"].astype(int).values
     y_cov = (train["margin"] > train["close_spread"]).astype(int).values
     rng = np.random.default_rng(args.seed)
-    common_kw = dict(max_iter=400, learning_rate=0.05, max_depth=4, l2_regularization=1.0)
+    # 規則化較強的設定:小資料上避免過擬合(過擬合會讓 test AUC 低於市場 baseline)
+    common_kw = dict(max_iter=150, learning_rate=0.03, max_depth=3, l2_regularization=10.0)
     m_win = HistGradientBoostingClassifier(**common_kw, random_state=args.seed).fit(X_all[:i_tr], y_win)
     m_cov = HistGradientBoostingClassifier(**common_kw, random_state=args.seed).fit(X_all[:i_tr], y_cov)
     p_home_all = m_win.predict_proba(X_all)[:, 1]

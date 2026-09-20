@@ -1,7 +1,10 @@
 """產生合成 demo 賽事資料(籃球風格):結果 + 開/收盤盤口 + 賠率 + 自訂特徵。
 
 輸出單一 CSV(欄位規格見 data/SCHEMA.md)。
-- 約 12% 的賽事實現「盤口誤價」(bookmaker 賠率偏離真實機率),讓模型有可學的信號。
+- 約 25% 的賽事實現「盤口誤價」(bookmaker 賠率偏離真實機率,±0.02~0.06,
+  收盤仍保留六成)→ 模型有可學的信號,市場 baseline 依然很強。
+- 休息天數真實影響分差(2.5 分/天差)但盤口看不到 → 勝負與「讓分覆蓋」都有
+  可學的非效率(對應真實的輪休/傷兵資訊)。
 - 盤口:收盤比開盤更有效(收盤更接近真實),開盤含更多雜訊 → 盤口移動本身是特徵。
 - 隊實力隨時間漂移,模擬聯賽季節性變化。
 
@@ -70,15 +73,20 @@ def main() -> None:
         for day_idx, i, j in games:
             gid += 1
 
+            h_rest, a_rest = int(rng.integers(1, 4)), int(rng.integers(1, 4))
+
             # 實力差對分差的影響放大 3 倍(接近真實籃球:實力差 sd≈4-5 分,單場分差 sd≈11),
             # 否則勝率機率會被壓在 0.5~0.65、賠率沒有區隔度
             latent = 3.0 * (strength[i] - strength[j]) + HOME_ADV
-            margin = latent + rng.normal(0.0, MARGIN_SD)
+            # 休息天數真實影響分差(約 2.5 分/天差),但 book 的盤口看不到
+            # → 市場有可挖的非效率(對應真實世界的輪休/傷兵資訊)
+            rest_edge = 2.5 * (a_rest - h_rest)
+            margin = latent + rest_edge + rng.normal(0.0, MARGIN_SD)
             p_true = 1.0 / (1.0 + math.exp(-latent / MARGIN_SD))
 
-            # 盤口:~12% 出現誤價
-            mis = (rng.uniform(0.02, 0.055) * (1.0 if rng.random() < 0.5 else -1.0)
-                   if rng.random() < 0.12 else 0.0)
+            # 盤口:~25% 出現誤價(幅度 ±0.02~0.06)→ 市場有漏洞可挖,teacher 能小幅贏過市場
+            mis = (rng.uniform(0.02, 0.06) * (1.0 if rng.random() < 0.5 else -1.0)
+                   if rng.random() < 0.25 else 0.0)
             p_close = float(np.clip(p_true + rng.normal(0.0, 0.008) + 0.25 * mis, 0.05, 0.95))
             p_open = float(np.clip(p_true + rng.normal(0.0, 0.035) + mis, 0.05, 0.95))
 
@@ -99,7 +107,6 @@ def main() -> None:
             aw, al = sum(last10[teams[j]]), len(last10[teams[j]]) - sum(last10[teams[j]])
             h_avg = float(np.mean(scored[teams[i]])) if scored[teams[i]] else 112.0
             a_avg = float(np.mean(scored[teams[j]])) if scored[teams[j]] else 112.0
-            h_rest, a_rest = int(rng.integers(1, 4)), int(rng.integers(1, 4))
             pair = frozenset((teams[i], teams[j]))
             recent = list(h2h.get(pair, deque()))[-5:]
             hh = sum(1 for (w, _m) in recent if w == teams[i])

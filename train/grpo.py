@@ -11,17 +11,20 @@ reward 設計(單樣本):
   - 讓分覆蓋 Brier(權重 0.3)       → 0..0.3
 
 ⚠️ 注意:
-  1. 需要 trl: pip install trl
-  2. TRL 的 GRPOTrainer API 在版本之間變動很快;此腳本以 0.11+ 風格撰寫,
-     若與你所裝版本不兼容,請對照該版文件的 sample(範例)微調引數。
-  3. 建議先跑完 SFT(+DPO)再上 GRPO,否則小模型的 on-policy 探索會很不穩。
-  4. VRAM:0.9B + GRPO(num_generations=8)在 24GB(3090/4090)可用;8GB 請調小
-     num_generations / max_completion_length 並開啟 --lora。
+  1. 需要 trl(pip install trl);本腳本以 TRL 1.x 的 GRPOTrainer API 撰寫與驗證。
+  2. 建議先跑完 SFT(+DPO)再上 GRPO,否則小模型的 on-policy 探索會很不穩。
+  3. VRAM:0.9B + GRPO(num_generations=8)在 24GB(3090/4090)可用;8GB 請調小
+     --num-generations / --max-completion。
 
 範例:
   python train/grpo.py --model-id IFM/K2-Horizon-0.9B --trust-remote-code \
       --train-jsonl data/out/train.jsonl --adapter-dir output/sft --output-dir output/grpo \
       --num-generations 8 --batch-size 2 --max-completion 512
+
+CPU smoke test(tiny 模型;注意 TRL 要求 batch-size 能被 num-generations 整除):
+  python train/grpo.py --model-id tools/tiny_model --dtype float32 \
+      --train-jsonl data/out_smoke/train.jsonl --output-dir output/smoke_grpo \
+      --lora --num-generations 2 --batch-size 2 --max-completion 96 --max-steps 2
 """
 from __future__ import annotations
 
@@ -41,28 +44,40 @@ except ImportError as e:  # pragma: no cover
     sys.exit(f"缺少依賴({e});先 pip install -r requirements.txt")
 
 try:
+    from datasets import Dataset as HFDataset
     from trl import GRPOConfig, GRPOTrainer
 except ImportError:
-    sys.exit("缺少 trl: pip install trl 後重試(GRPO 為選用階段)")
+    sys.exit("缺少 trl / datasets: pip install trl datasets 後重試(GRPO 為選用階段)")
 
 from common import parse_response
 from train.sft import DTYPES, load_causal_lm
 
 
 def make_reward():
-    """TRL reward function:接收 completions(字串)與 dataset 的額外欄位。"""
+    """TRL 1.x reward function。
 
-    def reward(completions, outcome_home, cover_home, **_kw):
+    TRL 以關鍵字呼叫:reward_func(prompts=..., completions=..., completion_ids=...,
+    **dataset 額外欄位)→ 回傳 list[float](每個 completion 一個分數)。
+    """
+
+    def reward(prompts=None, completions=None, completion_ids=None,
+               outcome_home=None, cover_home=None, **_kw):
+        if completions is None or outcome_home is None:
+            return None  # TRL 會以 NaN 處理並警告
         out = []
-        for text, y, c in zip(completions, outcome_home, cover_home):
+        ys = outcome_home if isinstance(outcome_home, list) else [outcome_home]
+        cs = cover_home if isinstance(cover_home, list) else ([cover_home] * len(ys))
+        for text, y, c in zip(completions, ys, cs):
             s = 0.0
-            p = parse_response(text if isinstance(text, str) else str(text))
+            if isinstance(text, (bytes, bytearray)):
+                text = text.decode("utf-8", errors="ignore")
+            p = parse_response(str(text))
             if p["format_ok"] and p["p_home"] is not None:
                 s += 1.0
                 s += 1.0 - (p["p_home"] - float(y)) ** 2
                 pred = p["pred"] or ("主隊" if p["p_home"] >= 0.5 else "客隊")
-                s += 0.5 if pred == ("主隊" if y == 1 else "客隊") else 0.0
-                if p["cover_home"] is not None:
+                s += 0.5 if pred == ("主隊" if float(y) == 1 else "客隊") else 0.0
+                if p["cover_home"] is not None and c is not None:
                     s += 0.3 * (1.0 - (p["cover_home"] - float(c)) ** 2)
             out.append(s)
         return out
@@ -76,16 +91,17 @@ def main() -> None:
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
     ap.add_argument("--train-jsonl", default="data/out/train.jsonl")
-    ap.add_argument("--adapter-dir", default=None, help="從 SFT adapter 繼續(建議)")
+    ap.add_argument("--adapter-dir", default=None, help="從 SFT/DPO adapter 繼續(建議)")
     ap.add_argument("--output-dir", default="output/grpo")
     ap.add_argument("--batch-size", type=int, default=2)
     ap.add_argument("--num-generations", type=int, default=8)
     ap.add_argument("--max-completion", type=int, default=512)
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--beta", type=float, default=0.0, help="KL 係數;0=不限制(可試 0.01)")
+    ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--max-steps", type=int, default=-1)
-    ap.add_argument("--lora", action="store_true", help="用 LoRA 跑 GRPO(省 VRAM,預設建議開啟)")
+    ap.add_argument("--lora", action="store_true", help="無 adapter 時:用新 LoRA 跑 GRPO(省 VRAM)")
     ap.add_argument("--seed", type=int, default=42)
     args = ap.parse_args()
 
@@ -107,8 +123,8 @@ def main() -> None:
     model = load_causal_lm(args.model_id, DTYPES[args.dtype], args.trust_remote_code)
     if args.adapter_dir:
         from peft import PeftModel
-        model = PeftModel.from_pretrained(model, args.adapter_dir)
-    if args.lora:
+        model = PeftModel.from_pretrained(model, args.adapter_dir, is_trainable=True)
+    elif args.lora:
         from peft import LoraConfig, TaskType, get_peft_model
         model = get_peft_model(model, LoraConfig(
             r=16, lora_alpha=32, bias="none", task_type=TaskType.CAUSAL_LM))
@@ -121,10 +137,12 @@ def main() -> None:
         per_device_train_batch_size=args.batch_size,
         num_generations=args.num_generations,
         max_completion_length=args.max_completion,
+        temperature=args.temperature,
         beta=args.beta,
         num_train_epochs=args.epochs,
         max_steps=args.max_steps,
-        logging_steps=10,
+        logging_steps=5,
+        save_steps=args.max_steps if args.max_steps > 0 else 100,
         report_to=[],
         seed=args.seed,
         bf16=torch.cuda.is_available(),
@@ -133,7 +151,7 @@ def main() -> None:
         model=model,
         args=cfg,
         reward_funcs=[make_reward()],
-        train_dataset=rows,
+        train_dataset=HFDataset.from_list(rows),
         processing_class=tok,
     )
     trainer.train()
