@@ -1,0 +1,15 @@
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+# 模型與訓練產物(可再生成,勿進 git)
+output/
+tools/tiny_model/
+
+# 資料產物(可再生成;保留 examples/ 與 SCHEMA.md)
+data/demo/
+data/out*/
+
+# 本機環境
+.env

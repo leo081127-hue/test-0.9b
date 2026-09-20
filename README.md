@@ -1,1 +1,175 @@
-# test-0.9b
+# 0.9B 體育賽事預測模型 — 微調開源基座完整 Pipeline
+
+用 **0.9B 級開源模型**(預設 [IFM/K2-Horizon-0.9B](https://huggingface.co/IFM/K2-Horizon-0.9B))微調一個
+**體育賽事預測模型**:輸入「歷史賽事特徵 + 盤口/賠率 + 自訂特徵」,輸出
+**勝負/讓分結果 + 機率 + 推理理由**,並帶有**校準機率**(可以用 Brier 分數評估)。
+
+```
+你的資料(3 張表)          合成 demo 資料(沒資料時)
+      │  join 成 matches.csv          │
+      └──────────────┬────────────────┘
+                     ▼
+        data/build_dataset.py
+        時間切分 train/val/test + teacher(GBM)蒸餾目標機率
+                     ▼
+        train/sft.py      階段1 LoRA SFT:學「盤口+特徵 → 機率+理由」
+                     ▼
+        train/dpo.py      階段2 (選用) DPO:修正過度自信 / 方向錯誤
+                     ▼
+        train/grpo.py     階段3 (選用) GRPO RL:reward = Brier + 格式
+                     ▼
+        eval/evaluate.py  acc / Brier / LogLoss / ECE,對照市場收盤賠率 & LogReg
+                     ▼
+        infer/predict.py  單筆新賽事預測 CLI
+```
+
+---
+
+## 1. 先說三句實話(重要)
+
+1. **真正的對手是收盤賠率。** 市場收盤賠率(去除抽水後)就是目前所有公開資訊的綜合。
+   穩定贏過收盤線(closing line value)是專業量化團隊的事。本 repo 的評估**一定會把
+   市場收盤賠率列為基準**——你的模型只有贏過它,才談得上有價值。
+2. **0.9B 的價值在哪?** ① 便宜快(單張消费級 GPU 就能微調);② 可解釋——每筆預測附推理;
+   ③ 能透過「teacher 蒸餾 + RL」吸收盤口特徵 → 機率 的非線性模式;④ K2-Horizon 本身就是
+   RL(GRPO)訓練出來的 reasoning 模型,接續 RL 階段最順。
+3. **demo 合成資料裡故意放了 12% 的「盤口誤價」**,所以 demo 上模型會「贏過市場」——
+   那只是驗證管線用,換上你的真實資料後,成績對照市場基準才有意義。
+
+## 2. 基座模型選擇
+
+| 模型 | 參數 | 說明 |
+|---|---|---|
+| `IFM/K2-Horizon-0.9B`(預設) | 0.9B | 128K context、reasoning 型、GRPO 血統。⚠️ 自帶 custom code,所有命令加 `--trust-remote-code`;bf16 使用;推論建議 vLLM(見該 model card) |
+| `Qwen/Qwen3-1.7B`(備用) | 1.7B | 生態支援最好、效果通常更好;8GB 显存可 LoRA 微調 |
+| `Qwen/Qwen2.5-1.5B`(備用) | 1.5B | 同上,更省資源 |
+
+換基座只需改 `MODEL_ID`(見下)。本 repo 的 prompt 格式、解析格式與基座無關。
+
+## 3. 硬體 / 時間估計(1,500 筆樣本 × 3 epochs,seq≤1024)
+
+| 顯存 | 可行內容 |
+|---|---|
+| 8GB (RTX 3060/4060) | SFT + DPO(建議 `--grad-ckpt`);GRPO 需調小 `--num-generations 4` |
+| 16GB (3070/4060 Ti) | SFT + DPO 從容 |
+| 24GB (3090/4090/A5000) | 全三階段,GRPO `--num-generations 8` |
+
+免費方案:Colab Pro(T4 16GB)、Kaggle Notebook(24GB,每週 30h GPU)都行。
+沙盒內(無 GPU)可用 `scripts/smoke_test.sh` 驗證管線(本地小模型,CPU)。
+
+## 4. 快速開始
+
+```bash
+pip install -r requirements.txt
+
+# A) 有真實資料:先把「歷史賽事 + 賠率/盤口 + 特徵表」join 成一個 csv(欄位見 data/SCHEMA.md)
+# B) 沒有:用合成 demo 資料跑通管線
+export MATCHES=data/demo/matches.csv          # A) 時改成你的路徑
+export MODEL_ID=IFM/K2-Horizon-0.9B           # 預設值
+export EXTRA_ARGS="--trust-remote-code"       # K2-Horizon 需要;換 Qwen 就留空
+
+bash scripts/run_all.sh
+# 輸出: output/sft、output/dpo、output/report.json、output/calibration.png
+```
+
+### 單筆新賽事預測
+
+```bash
+python infer/predict.py --model-id "$MODEL_ID" $EXTRA_ARGS \
+    --adapter-dir output/dpo --features-json my_game.json
+# my_game.json 欄位見 data/SCHEMA.md(結果欄位 home_win/margin 等可以不填)
+```
+
+### CPU smoke test(本沙盒 / CI,無網路無 GPU 也能跑)
+
+```bash
+bash scripts/smoke_test.sh
+```
+
+## 5. 你的資料怎麼放進來
+
+你說的三類資料 → 合併成 **一個 csv**,以 `match_id` join:
+
+| 你的資料 | 對應欄位 |
+|---|---|
+| 歷史賽事數據 | `match_id, date, season, league, home, away, home_score, away_score, home_win, margin` |
+| 賠率 / 盤口 | `open_spread, close_spread, open_total, close_total, open_ml_home/away, close_ml_home/away` |
+| 自訂特徵表 | `home_form_w/l, away_form_w/l, home_avg_pts, away_avg_pts, home_rest, away_rest, home_record, away_record, h2h_home_w, h2h_away_w` |
+
+- 完整欄位說明:`data/SCHEMA.md`,範例:`data/examples/matches_sample.csv`
+- **讓分慣例**:數值 = 主隊讓分;`-5.5` = 主隊讓 5.5 分。
+- **防資料洩漏**:`build_dataset.py` 一律依 `date` 時間切分;特徵欄(近10場狀態、紀錄)
+  必須是「該場開打前」的值——生成 demo 資料時已如此處理,你的特徵表也請照此對齊。
+- 想加自訂特徵:數值型欄位加進 `common.py` 的 `FEATURE_COLS` 就會進 teacher 與 baseline;
+  想讓模型「看得到」,再把它加進 `common.format_game_features()`。
+- 沒有盤口資料?讓分填 `0`、ML 填 `1.85/1.90` 即可跑(但評估時 market 基準會失效)。
+
+## 6. 訓練細節
+
+### 階段 1:SFT(`train/sft.py`)
+- LoRA(r=16, α=32)只训 attention/MLP projections,0.9B 下約 +0.5% 可訓參數。
+- **機率目標從哪來**:用 `HistGradientBoostingClassifier`(只用 train 段擬合)對
+  「勝負」與「讓分覆蓋」各擬合一個 teacher,把它的機率 + 模板推理文字當 SFT 目標——
+  這是「tabular teacher → LLM 蒸餾」,0.9B 模型學「看哪些特徵」比從原始標籤學更穩。
+- 只對 assistant 段算 loss(prompt 段 mask 成 -100)。
+- 建議:`--epochs 3` 起,盯 `eval_loss`;val loss 開始回升就停(小模型很容易背答案)。
+
+### 階段 2:DPO(`train/dpo.py`)
+- pairs 由 teacher 產出:`chosen` = 正確判斷的回應;`rejected` = 把機率往反方向扭曲的回應。
+- 目的:壓制過度自信、把方向錯誤的輸出概率降下來。1 個 epoch、lr 5e-5 通常足夠。
+
+### 階段 3:GRPO(`train/grpo.py`,選用)
+- 你的「enhance RL」需求就放在這:體育預測有**可驗證的 reward**(結果出來就知道準不準),
+  正適合 on-policy RL。reward = 格式分 + 勝率 Brier + 方向分 + 讓分覆蓋 Brier(權重 0.3)。
+- 這與 K2-Horizon 自己的訓練路線一致(它的 math/code 專家都是 GRPO 練出來再 merge)。
+- 需 `pip install trl`;0.9B + `--num-generations 8` 建議 24GB 顯存。
+- ⚠️ TRL API 版本間變動快,腳本以 0.11+ 風格撰寫,報錯時對照你所裝版本的範例微調。
+
+## 7. 評估指標(`eval/evaluate.py`)
+
+| 指標 | 意義 | 怎么看 |
+|---|---|---|
+| acc / pred_acc | 預測主/客是否正確 | 體育 ~52-55% 就算不錯 |
+| **brier** | 機率校準品質(越小越好,0.25=coin) | **最重要的指標** |
+| logloss | 同 brier 的 log 版本 | 越小越好 |
+| ECE | 置信度 vs 實際準確率 | 越接近 0 越誠實 |
+| cover_acc | 讓分覆蓋準確率 | 盤口約 50%,看是否 >50% |
+| parse_error_rate | 格式解析失敗率 | 應該 <2%,否則調 `--max-new-tokens` 或重訓 |
+
+`report.json` 會同時給 **LLM / Market close / LogReg / Coin** 四組數字——
+**LLM 的 brier 要贏過 Market close 才算有意義**。`calibration.png` 畫三者的校準曲線。
+
+## 8. 故障排除
+
+| 症狀 | 解法 |
+|---|---|
+| `trust_remote_code` 載入失敗(K2-Horizon) | 確認 `transformers>=4.44`、PyTorch 2.x;該模型官方建議 bf16(`--dtype bfloat16`,預設就是) |
+| OOM | `--grad-ckpt`、降 `--batch-size`/`--grad-accum`、DPO 用 4bit reference(目前用 disable-adapter 技巧,已省一份 VRAM) |
+| parse_error_rate 高 | 調大 `--max-new-tokens`(預設 384)、確認用對 adapter;推理用 `temperature=0` |
+| val loss 下降但 test 贏不了 market | 正常!檢查是否資料太少/盤口品質差;先確認 LogReg baseline 本身能否贏 market(它贏不了,LLM 更難) |
+| 想加速推論 | vLLM serve(見 K2-Horizon model card 的 quickstart),adapter 合併後部署 |
+
+## 9. 專案結構
+
+```
+common.py                    # prompt 格式 / 回應解析 / 特徵矩陣 / 指標(所有模組共用)
+data/
+  SCHEMA.md                  # matches.csv 欄位規格
+  examples/matches_sample.csv
+  generate_demo_data.py      # 合成 demo 資料
+  build_dataset.py           # 時間切分 + teacher 蒸餾 → train/val/test.jsonl + dpo_pairs.jsonl
+train/
+  sft.py                     # LoRA SFT(主)
+  dpo.py                     # DPO(選用)
+  grpo.py                    # GRPO RL(選用,需 trl)
+eval/evaluate.py             # 評估 + baseline 對照 + report.json + calibration.png
+infer/predict.py             # 單筆預測 CLI
+tools/smoke_tiny_model.py    # 本地 tiny 模型(無網路 smoke test 用)
+scripts/run_all.sh           # 一條龍(GPU 機器)
+scripts/smoke_test.sh        # CPU smoke(無 GPU 也能跑)
+```
+
+## 10. 免責
+
+本專案僅供**學習與研究**。體育賠率由持牌機構提供,任何預測都不保證獲利;
+請遵守所在地法律,不要把它當成投注建議。
