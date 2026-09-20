@@ -1,0 +1,15 @@
+# ---- 資料管線 ----
+numpy>=1.26
+pandas>=2.0
+scikit-learn>=1.4
+matplotlib>=3.8
+
+# ---- 訓練 / 推論 ----
+torch>=2.2
+transformers>=4.44
+peft>=0.12
+accelerate>=0.30
+
+# ---- 選用:GRPO(RL)階段, train/grpo.py(已對 trl 1.x 驗證)----
+# trl>=1.0
+# datasets>=3.0
