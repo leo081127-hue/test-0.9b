@@ -25,8 +25,58 @@ if _ROOT not in sys.path:
 import numpy as np
 import pandas as pd
 
-from common import _acc_brier_logloss, ece, feature_matrix, implied_prob, parse_response
+from common import (_acc_brier_logloss, _acc_brier_logloss_mc, ece, ece_mc,
+                    feature_matrix, implied_prob, implied_prob_3way,
+                    outcome_from_margin, parse_response)
 from train.sft import DTYPES, load_causal_lm
+
+
+def run_model_eval_soccer(args, rows: list[dict]):
+    """足球 1X2:解析三結果機率 → 多類 acc/Brier/LogLoss/ECE。"""
+    import torch
+    from transformers import AutoTokenizer
+    from peft import PeftModel
+
+    tok = AutoTokenizer.from_pretrained(args.model_id, trust_remote_code=args.trust_remote_code)
+    if tok.pad_token_id is None:
+        tok.pad_token = tok.eos_token
+    model = load_causal_lm(args.model_id, DTYPES[args.dtype], args.trust_remote_code)
+    if args.adapter_dir:
+        model = PeftModel.from_pretrained(model, args.adapter_dir)
+    if torch.cuda.is_available():
+        model = model.cuda()
+    model.eval()
+
+    P, Y, llm_rows = [], [], []
+    n_err = 0
+    for k, row in enumerate(rows):
+        text = tok.apply_chat_template(row["prompt"], tokenize=False, add_generation_prompt=True)
+        ids = tok(text, return_tensors="pt").to(model.device)
+        with torch.no_grad():
+            gen = model.generate(
+                **ids, max_new_tokens=args.max_new_tokens,
+                do_sample=False, pad_token_id=tok.pad_token_id,
+            )
+        out = tok.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
+        p = parse_response(out, "soccer")
+        if p["p_home"] is None:
+            n_err += 1
+            print(f"[{k + 1}/{len(rows)}] {row['match_id']}  parse FAIL (raw: {out[:80]!r})")
+            continue
+        y = int(row["outcome"])
+        yv = [0.0, 0.0, 0.0]
+        yv[y] = 1.0
+        P.append([p["p_home"], p["p_draw"], p["p_away"]])
+        Y.append(yv)
+        llm_rows.append({"match_id": row["match_id"], "p": [p["p_home"], p["p_draw"], p["p_away"]]})
+        if (k + 1) % 10 == 0 or k + 1 == len(rows):
+            print(f"[{k + 1}/{len(rows)}] generated")
+
+    Pm = np.array(P); Ym = np.array(Y)
+    m = _acc_brier_logloss_mc(Pm, Ym)
+    m["ece"] = ece_mc(Pm, Ym)
+    m["parse_error_rate"] = n_err / max(1, len(rows))
+    return m, Pm, Ym, llm_rows
 
 
 def run_model_eval(args, rows: list[dict]):
@@ -84,12 +134,154 @@ def run_model_eval(args, rows: list[dict]):
     return m, llm_p, llm_y, llm_rows
 
 
+def main_soccer_baselines(args, rows: list[dict], report: dict,
+                         llm_p, llm_y, llm_rows) -> None:
+    """足球 1X2 的 baseline / pred-out / 分季 / 輸出 / 校準圖。"""
+    df = pd.read_csv(args.matches_csv)
+    test_ids = {r["match_id"] for r in rows}
+    tm = df[df["match_id"].isin(test_ids)].reset_index(drop=True)
+    ym3 = np.array([outcome_from_margin(m) for m in tm["margin"].values])
+
+    if args.pred_out and not args.no_model and llm_rows:
+        src = df.set_index("match_id")
+        recs = []
+        for lr in llm_rows:
+            m = src.loc[lr["match_id"]]
+            recs.append({
+                "match_id": lr["match_id"],
+                "date": m.get("date", ""),
+                "season": m.get("season", ""),
+                "p_home": lr["p"][0], "p_draw": lr["p"][1], "p_away": lr["p"][2],
+                "open_ml_home": m.get("open_ml_home", ""),
+                "open_ml_draw": m.get("open_ml_draw", ""),
+                "open_ml_away": m.get("open_ml_away", ""),
+                "close_ml_home": m.get("close_ml_home", ""),
+                "close_ml_draw": m.get("close_ml_draw", ""),
+                "close_ml_away": m.get("close_ml_away", ""),
+                "outcome": outcome_from_margin(m.get("margin", 0)),
+            })
+        pd.DataFrame(recs).to_csv(args.pred_out, index=False)
+        print(f"preds  -> {args.pred_out} ({len(recs)} rows)")
+
+    mkt3 = np.array([implied_prob_3way(r.close_ml_home, r.close_ml_draw, r.close_ml_away)
+                     for r in tm.itertuples()])
+    Y3 = np.zeros((len(ym3), 3)); Y3[np.arange(len(ym3)), ym3] = 1.0
+    mkt = _acc_brier_logloss_mc(mkt3, Y3)
+    mkt["ece"] = ece_mc(mkt3, Y3)
+    report["Market_close"] = mkt
+
+    boundary = min(r["date"] for r in rows)
+    trn = df[df["date"] < boundary]
+    X_tr, _ = feature_matrix(trn)
+    y_tr = np.array([outcome_from_margin(m) for m in trn["margin"].values])
+    X_te, _ = feature_matrix(tm)
+    from sklearn.linear_model import LogisticRegression
+    lr = LogisticRegression(max_iter=3000).fit(X_tr, y_tr)
+    lr3 = lr.predict_proba(X_te)
+    cls = list(lr.classes_)
+    L3 = np.zeros((len(lr3), 3))
+    for k, c in enumerate(cls):
+        L3[:, int(c)] = lr3[:, k]
+    lrm = _acc_brier_logloss_mc(L3, Y3)
+    lrm["ece"] = ece_mc(L3, Y3)
+    report["LogReg"] = lrm
+
+    coin = _acc_brier_logloss_mc(np.full((len(ym3), 3), 1.0 / 3.0), Y3)
+    coin["ece"] = ece_mc(np.full((len(ym3), 3), 1.0 / 3.0), Y3)
+    report["Coin"] = coin
+
+    if "season" in df.columns:
+        season_of = dict(zip(df["match_id"], df["season"]))
+        outcome_of = {m: outcome_from_margin(mm) for m, mm in zip(df["match_id"], df["margin"])}
+        by_season: dict = {}
+        for s in sorted(set(season_of.values())):
+            mids = {m for m, se in season_of.items() if se == s}
+            entry: dict = {}
+            if llm_rows:
+                sel = [r for r in llm_rows if r["match_id"] in mids]
+                if sel:
+                    Psel = np.array([r["p"] for r in sel])
+                    Ysel = np.zeros((len(sel), 3))
+                    Ysel[np.arange(len(sel)), [outcome_of[r["match_id"]] for r in sel]] = 1.0
+                    entry["LLM"] = _acc_brier_logloss_mc(Psel, Ysel)
+            mt = tm[tm["match_id"].isin(mids)]
+            if len(mt) > 0:
+                mp = np.array([implied_prob_3way(r.close_ml_home, r.close_ml_draw, r.close_ml_away)
+                               for r in mt.itertuples()])
+                yy = np.array([outcome_from_margin(m) for m in mt["margin"].values])
+                Ym_ = np.zeros((len(yy), 3)); Ym_[np.arange(len(yy)), yy] = 1.0
+                entry["Market"] = _acc_brier_logloss_mc(mp, Ym_)
+            if entry:
+                by_season[s] = entry
+        report["by_season"] = by_season
+
+    os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    def fmt(v, nd=4):
+        return f"{v:.{nd}f}" if v is not None else "  n/a "
+
+    print(f"\n{'model':<14}{'acc':>7}{'brier':>9}{'logloss':>10}{'ece':>8}  extra")
+    for name in ("LLM", "Market_close", "LogReg", "Coin"):
+        m = report[name]
+        if m is None:
+            continue
+        extra = f"parse_err={fmt(m['parse_error_rate'], 3)}" if name == "LLM" else ""
+        print(f"{name:<14}{fmt(m['acc'], 3):>7}{fmt(m['brier']):>9}{fmt(m['logloss']):>10}"
+              f"{fmt(m['ece']):>8}  {extra}")
+    if report.get("by_season"):
+        print(f"\n{'season':<12}{'model':<10}{'acc':>7}{'brier':>9}{'n':>6}")
+        for s, entry in report["by_season"].items():
+            for name in ("LLM", "Market"):
+                if name in entry:
+                    m = entry[name]
+                    print(f"{s:<12}{name:<10}{fmt(m['acc'], 3):>7}{fmt(m['brier']):>9}{m['n']:>6}")
+    print(f"\nreport -> {args.report}")
+
+    if args.plot:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        def curve_mc(P, Y, n_bins=10):
+            conf = P.max(1)
+            correct = (P.argmax(1) == Y.argmax(1)).astype(float)
+            idx = np.clip(np.digitize(conf, np.linspace(0, 1, n_bins + 1)[1:-1]),
+                          0, n_bins - 1)
+            xs, ys = [], []
+            for b in range(n_bins):
+                lo, hi = b / n_bins, (b + 1) / n_bins
+                m = idx == b
+                if m.sum() >= 2:
+                    xs.append((lo + hi) / 2); ys.append(correct[m].mean())
+            return xs, ys
+
+        fig, ax = plt.subplots(figsize=(6, 5))
+        if llm_p is not None and llm_p.size > 0:
+            xs, ys = curve_mc(llm_p, llm_y)
+            ax.plot(xs, ys, "^-", color="tab:red", label="LLM (ours)")
+        xs, ys = curve_mc(mkt3, Y3)
+        ax.plot(xs, ys, "o-", label="Market close")
+        xs, ys = curve_mc(L3, Y3)
+        ax.plot(xs, ys, "s-", label="LogReg")
+        ax.plot([0, 1], [0, 1], "k--", lw=1)
+        ax.set_xlabel("confidence (max outcome prob)"); ax.set_ylabel("accuracy")
+        ax.set_title("Calibration (test, 1X2)")
+        ax.legend(); ax.grid(alpha=0.3)
+        os.makedirs(os.path.dirname(args.plot) or ".", exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=120)
+        print(f"plot   -> {args.plot}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-id", default="IFM/K2-Horizon-0.9B")
     ap.add_argument("--trust-remote-code", action="store_true")
     ap.add_argument("--dtype", default="bfloat16", choices=sorted(DTYPES))
     ap.add_argument("--adapter-dir", default=None)
+    ap.add_argument("--sport", choices=("basketball", "soccer"), default="basketball")
     ap.add_argument("--test-jsonl", required=True)
     ap.add_argument("--matches-csv", required=True, help="完整資料(baseline 要用 train 段擬合)")
     ap.add_argument("--report", default="output/report.json")
@@ -109,13 +301,20 @@ def main() -> None:
         rows = rows[:args.limit]
     print(f"test rows: {len(rows)}")
 
-    report = {"model_id": args.model_id, "adapter_dir": args.adapter_dir, "n_test": len(rows)}
+    report = {"model_id": args.model_id, "adapter_dir": args.adapter_dir,
+              "sport": args.sport, "n_test": len(rows)}
     llm_p, llm_y, llm_rows = None, None, None
 
     if not args.no_model:
-        report["LLM"], llm_p, llm_y, llm_rows = run_model_eval(args, rows)
+        if args.sport == "soccer":
+            report["LLM"], llm_p, llm_y, llm_rows = run_model_eval_soccer(args, rows)
+        else:
+            report["LLM"], llm_p, llm_y, llm_rows = run_model_eval(args, rows)
     else:
         report["LLM"] = None
+
+    if args.sport == "soccer":
+        return main_soccer_baselines(args, rows, report, llm_p, llm_y, llm_rows)
 
     # ---- baselines ----
     df = pd.read_csv(args.matches_csv)

@@ -6,29 +6,35 @@
 #   MATCHES     真實資料 csv(預設用合成 demo)
 #   PY          python 路徑(預設 python)
 #   USE_GRPO    =1 時跑第 4 階段 GRPO(需 pip install trl datasets;預設 0)
+#   SPORT       basketball(預設) 或 soccer(1X2 三結果;資料需有 *_ml_draw 欄)
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
 MODEL_ID="${MODEL_ID:-IFM/K2-Horizon-0.9B}"
 EXTRA_ARGS="${EXTRA_ARGS:---trust-remote-code}"
-MATCHES="${MATCHES:-data/demo/matches.csv}"
+SPORT="${SPORT:-basketball}"
+if [ -z "${MATCHES:-}" ]; then
+  if [ "$SPORT" = "soccer" ]; then MATCHES=data/demo/soccer.csv; else MATCHES=data/demo/matches.csv; fi
+fi
 PY="${PY:-python}"
 USE_GRPO="${USE_GRPO:-0}"
 
 FINAL_ADAPTER=output/dpo
 
-echo "==> [0/6] 資料品質檢查"
-if [ -f "$MATCHES" ]; then
-  $PY data/qa_report.py --matches "$MATCHES" --json output/qa.json || true
+echo "==> [0/6] demo 資料(有真實資料時設定 MATCHES=你的csv)"
+if [ ! -f "$MATCHES" ]; then
+  if [ "$SPORT" = "soccer" ]; then
+    $PY data/generate_demo_soccer.py --seasons 5 --games-per-season 200 --out "$MATCHES"
+  else
+    $PY data/generate_demo_data.py --out "$MATCHES"
+  fi
 fi
 
-echo "==> [1/6] demo 資料(有真實資料時設定 MATCHES=你的csv)"
-if [ ! -f "$MATCHES" ]; then
-  $PY data/generate_demo_data.py --out "$MATCHES"
-fi
+echo "==> [1/6] 資料品質檢查 (sport=$SPORT)"
+$PY data/qa_report.py --matches "$MATCHES" --sport "$SPORT" --json output/qa.json || true
 
 echo "==> [2/6] 建立 SFT / DPO 資料"
-$PY data/build_dataset.py --matches "$MATCHES" --out data/out
+$PY data/build_dataset.py --matches "$MATCHES" --out data/out --sport "$SPORT"
 
 echo "==> [3/6] SFT (LoRA)"
 $PY train/sft.py $EXTRA_ARGS \
@@ -64,6 +70,7 @@ fi
 echo "==> [5/6] 評估"
 $PY eval/evaluate.py $EXTRA_ARGS \
   --model-id "$MODEL_ID" --adapter-dir "$FINAL_ADAPTER" \
+  --sport "$SPORT" \
   --test-jsonl data/out/test.jsonl --matches-csv "$MATCHES" \
   --report output/report.json --plot output/calibration.png \
   --pred-out output/preds.csv
@@ -71,6 +78,7 @@ $PY eval/evaluate.py $EXTRA_ARGS \
 echo "==> [6/6] 回測(ROI / CLV / drawdown)"
 $PY eval/backtest.py \
   --preds output/preds.csv --matches-csv "$MATCHES" \
+  --sport "$SPORT" \
   --threshold 0.55 --report output/backtest.json --plot output/equity.png
 
 echo "done."

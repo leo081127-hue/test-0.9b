@@ -268,14 +268,55 @@ python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 30 秒)
 > 所以套件不斷言「GRPO 一定提升 reward」——那需要 GPU + 已 SFT 的模型,流程見 §6
 > 「RL 準備度審計(`--reward-audit`)」小節。
 
-## 11. Roadmap(還沒做)
+## 11. 足球 1X2(三結果:主勝/和/客勝)
 
-- **足球 1X2**:三結果(主/和/客)版本——Poisson 生成器 + 三類機率輸出(要改 `common.py`
-  格式與評估,目前是二分類架構)
-- 多聯賽聯合訓練、傷兵/陣容特徵、大小分(Over/Under)輸出
+```bash
+# 有真實足球資料(matches.csv 含 open_ml_draw/close_ml_draw 即自動走 soccer 路徑;
+# 欄位差異見 data/SCHEMA.md「足球」節)
+export SPORT=soccer
+bash scripts/run_all.sh
+# 沒資料:Dixon-Coles 風格合成 demo(與 repo 內 data/demo/soccer.csv 相同參數)
+python data/generate_demo_soccer.py --seasons 5 --games-per-season 200 --out data/demo/soccer.csv
+```
+
+- **格式**:回應 = `最終預測: 主隊/和局/客隊` + `機率: 主隊 x, 和局 x, 客隊 x`(三者和=1)。
+- **統計核心**(demo 生成器):bivariate Poisson(每隊攻擊/防守強度 + 主場優勢)+
+  **Dixon-Coles(1997)低分修正**(κ=0.10:獨立 Poisson 低估 0-0/1-1、高估 1-0/0-1,
+  修正後和局率才接近真實的 ~21-26%)。
+- **teacher**:三類 HGB(主/和/客)蒸餾;**評估**:三結果 acc / 多類 Brier / LogLoss / ECE,
+  對照 **Market close(1X2 去抽水)**、LogReg(多項)、Coin(均分 1/3,Brier=2/3)。
+- **回測**:max 機率 ≥ 門檻才下注、flat 1u @ 開盤 1X2 賠率,CLV vs 收盤市場
+  (market_open 基準 CLV≈0 當 sanity check)。
+- **GRPO reward**:格式 1 + 多類 Brier + 方向 0.5(soccer jsonl 帶 `outcome` 欄,自動切換)。
+- 誠實預期:1X2 的 argmax acc 天花板約 50-55%(和局幾乎永遠不是 argmax),**看 Brier**;
+  v1 不含讓分/大小分(下一版加 Asian handicap)。
+
+**demo 結果**(`data/demo/soccer.csv`,5 季 × 200 場,seed 7;70/15/15 時間切分,test 150 場):
+
+| model | acc | Brier | LogLoss | ECE |
+|---|---|---|---|---|
+| Market close(1X2 去抽水) | 0.527 | **0.5643** | **0.9543** | 0.067 |
+| teacher(我們模型的代理,三類 HGB) | **0.547** | 0.6077 | 1.0187 | — |
+| LogReg(多項) | 0.527 | 0.5847 | 0.9906 | 0.053 |
+| Coin(均分 1/3) | 0.480 | 0.6667 | 1.0986(=ln 3) | 0.147 |
+
+1X2 回測(flat 1u @ 開盤賠率,門檻 = max 機率):
+
+| 策略 | n | 命中率 | ROI | CLV | maxDD |
+|---|---|---|---|---|---|
+| teacher @ 0.55 | 79 | 60.8% | +2.9% | **+0.131** | 7.4u |
+| market_open 基準(收盤 favorite) | 55 | 72.7% | +8.9% | ≈ +0.004(sanity) | 2.6u |
+
+> teacher 的 argmax 方向略優於市場,但機率校準仍不及市場收盤(多類 Brier 0.61 vs 0.56)——
+> 這正是 RL(GRPO/DPO)該去推的部分:讓 0.9B 的機率「更貼近真實分佈」。
+
+## 12. Roadmap(還沒做)
+
+- 足球讓分(Asian handicap)+ 大小分(Over/Under)輸出
+- 多聯賽聯合訓練、傷兵/陣容特徵
 - GRPO 之上的 on-policy DPO 迭代、KL 調參
 
-## 12. 免責
+## 13. 免責
 
 本專案僅供**學習與研究**。體育賠率由持牌機構提供,任何預測都不保證獲利;
 請遵守所在地法律,不要把它當成投注建議。

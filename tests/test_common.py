@@ -146,9 +146,13 @@ def test_feature_matrix():
         "close_ml_home": [1.85, 2.4], "close_ml_away": [1.9, 1.55],
     })
     X, names = feature_matrix(df)
-    assert X.shape == (2, 20)
+    # 18 原始欄 + 6 派生欄(record w/d/l × 2);2 段 record → record_d 補 0
+    # 足球專屬(form_d / ml_draw)不在本 df → 自動跳過
+    assert X.shape == (2, 22)
     assert "home_record_w" in names
     assert X[0][names.index("home_record_w")] == 12
+    assert X[0][names.index("home_record_d")] == 0.0
+    assert "home_form_d" not in names and "open_ml_draw" not in names
     assert not np.isnan(X).any()
 
 

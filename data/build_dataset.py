@@ -29,7 +29,40 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 
-from common import build_prompt, build_response, feature_matrix, implied_prob
+from common import (OUTCOME_LABELS, build_prompt, build_response, feature_matrix,
+                    implied_prob, implied_prob_3way, outcome_from_margin)
+
+
+def make_reasons_soccer(r: pd.Series, p3: tuple, mkt3: tuple) -> list[str]:
+    """足球版:引用 1X2 賠率與 W-D-L 狀態。"""
+    out: list[str] = []
+    try:
+        hw, hd, hl = int(r["home_form_w"]), int(r.get("home_form_d", 0)), int(r["home_form_l"])
+        aw, ad, al = int(r["away_form_w"]), int(r.get("away_form_d", 0)), int(r["away_form_l"])
+        out.append(f"近10場狀態: 主隊 {hw}勝{hd}平{hl}負,客隊 {aw}勝{ad}平{al}負")
+        hp, ap = hw + hd * 0.5, aw + ad * 0.5
+        if abs(hp - ap) >= 2:
+            out.append(f"狀態比較: {'主隊' if hp > ap else '客隊'}近10場積分佔優")
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        hr, ar = int(r["home_rest"]), int(r["away_rest"])
+        if hr > ar:
+            out.append(f"輪休: 主隊休息 {hr} 天 > 客隊 {ar} 天")
+        elif ar > hr:
+            out.append(f"輪休: 客隊休息 {ar} 天 > 主隊 {hr} 天")
+    except (KeyError, TypeError, ValueError):
+        pass
+    try:
+        if int(r["h2h_home_w"]) + int(r["h2h_away_w"]) > 0:
+            out.append(f"近5次對決: 主隊 {int(r['h2h_home_w'])}-{int(r['h2h_away_w'])} 客隊")
+    except (KeyError, TypeError, ValueError):
+        pass
+    d = float(p3[0]) - float(mkt3[0])
+    if abs(d) >= 0.02:
+        side = OUTCOME_LABELS[int(np.argmax(p3))]
+        out.append(f"市場隱含主勝率 {mkt3[0]:.2f},模型評估 {p3[0]:.2f},差距偏{side}一方")
+    return out
 
 
 def make_reasons(r: pd.Series, p_home: float, mkt_home: float) -> list[str]:
@@ -71,10 +104,100 @@ def make_reasons(r: pd.Series, p_home: float, mkt_home: float) -> list[str]:
     return out
 
 
+def _margin3(test):
+    return np.array([outcome_from_margin(m) for m in test["margin"].values])
+
+
+def main_soccer(df, train, val, test, i_tr, i_va, args) -> None:
+    """足球 1X2:三類 teacher + 三結果機率回應。"""
+    X_all, names = feature_matrix(df)
+    print(f"teacher features ({len(names)}): {names}")
+    y3 = np.array([outcome_from_margin(m) for m in train["margin"].values])
+    common_kw = dict(max_iter=150, learning_rate=0.03, max_depth=3, l2_regularization=10.0)
+    m3 = HistGradientBoostingClassifier(**common_kw, random_state=args.seed).fit(X_all[:i_tr], y3)
+    P = m3.predict_proba(X_all)
+    # classes_ 可能不含某類(小資料)→ 對齊到 [主,和,客]
+    cls = list(m3.classes_)
+    P3 = np.zeros((len(P), 3))
+    for k, c in enumerate(cls):
+        P3[:, int(c)] = P[:, k]
+    tr_names = ["train", "val", "test"]
+    tr_slices = [slice(0, i_tr), slice(i_tr, i_va), slice(i_va, len(df))]
+    from sklearn.metrics import log_loss
+    print(f"teacher logloss (test): {log_loss(_margin3(test), P3[tr_slices[2]]):.4f}")
+
+    os.makedirs(args.out, exist_ok=True)
+    split_of = {}
+    for part, sl in zip(tr_names, tr_slices):
+        d = {"train": train, "val": val, "test": test}[part]
+        path = os.path.join(args.out, f"{part}.jsonl")
+        rows = []
+        for pos, (_, r) in enumerate(d.iterrows()):
+            p3 = [float(v) for v in P3[sl.start + pos]]
+            mkt3 = implied_prob_3way(r["close_ml_home"], r["close_ml_draw"], r["close_ml_away"])
+            game = r.to_dict()
+            y = outcome_from_margin(r["margin"])
+            rows.append({
+                "match_id": r["match_id"],
+                "date": r["date"],
+                "sport": "soccer",
+                "prompt": [{"role": "user", "content": build_prompt(game, "soccer")}],
+                "response": build_response(p3[0], None, make_reasons_soccer(r, p3, mkt3),
+                                           sport="soccer", p_draw=p3[1]),
+                "outcome": int(y),
+                "outcome_home": int(r["home_win"]),
+                "outcome_draw": int(r["margin"] == 0),
+                "cover_home": None,
+                "teacher_p": [round(v, 4) for v in p3],
+                "market_p_close": [round(float(v), 4) for v in mkt3],
+            })
+        with open(path, "w", encoding="utf-8") as f:
+            for row in rows:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        split_of[part] = rows
+        print(f"wrote {path} ({len(rows)} rows)")
+
+    train_by_id = {r["match_id"]: r for r in train.to_dict("records")}
+    pairs = []
+    for row in split_of["train"]:
+        p = row["teacher_p"]
+        # rejected:主/客互換 + 壓低和 → 明顯劣於 teacher 的判斷
+        rp = [p[2], max(0.02, p[1] * 0.5), p[0]]
+        s = sum(rp)
+        rp = [v / s for v in rp]
+        game = train_by_id.get(row["match_id"])
+        if game is None:
+            continue
+        mkt3 = implied_prob_3way(game["close_ml_home"], game["close_ml_draw"], game["close_ml_away"])
+        pairs.append({
+            "match_id": row["match_id"],
+            "prompt": row["prompt"][0]["content"],
+            "chosen": row["response"],
+            "rejected": build_response(rp[0], None, make_reasons_soccer(pd.Series(game), rp, mkt3),
+                                       sport="soccer", p_draw=rp[1]),
+            "outcome": row["outcome"],
+        })
+    rng = np.random.default_rng(args.seed)
+    if args.max_pairs and len(pairs) > args.max_pairs:
+        idx = np.sort(rng.choice(len(pairs), args.max_pairs, replace=False))
+        pairs = [pairs[i] for i in idx]
+    path = os.path.join(args.out, "dpo_pairs.jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        for p_ in pairs:
+            f.write(json.dumps(p_, ensure_ascii=False) + "\n")
+    print(f"wrote {path} ({len(pairs)} pairs)")
+
+    sample = split_of["test"][0] if split_of["test"] else split_of["train"][0]
+    print("\n===== sample (test) =====")
+    print("PROMPT:\n" + sample["prompt"][0]["content"])
+    print("\nRESPONSE:\n" + sample["response"])
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--matches", default="data/demo/matches.csv")
     ap.add_argument("--out", default="data/out")
+    ap.add_argument("--sport", choices=("basketball", "soccer"), default="basketball")
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--max-pairs", type=int, default=4000, help="DPO pairs 上限(0=全部 train)")
@@ -89,6 +212,9 @@ def main() -> None:
     train, val, test = df.iloc[:i_tr], df.iloc[i_tr:i_va], df.iloc[i_va:]
     print(f"split by date: train={len(train)} (..{train['date'].iloc[-1]}), "
           f"val={len(val)}, test={len(test)} (from {test['date'].iloc[0]})")
+
+    if args.sport == "soccer":
+        return main_soccer(df, train, val, test, i_tr, i_va, args)
 
     # ---- teacher(只吃 train 的特徵)----
     X_all, names = feature_matrix(df)

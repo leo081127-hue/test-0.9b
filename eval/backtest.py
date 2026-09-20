@@ -37,6 +37,12 @@ def implied_home(odds_home, odds_away) -> np.ndarray:
     return qh / (qh + qa)
 
 
+def implied_3way(odds: np.ndarray) -> np.ndarray:
+    """[N,3] 十進位賠率 → [N,3] 去抽水機率(比例法)。"""
+    q = 1.0 / np.asarray(odds, dtype=float)
+    return q / q.sum(1, keepdims=True)
+
+
 def run_strategy(p_home: np.ndarray, odds_home: np.ndarray, odds_away: np.ndarray,
                  y_home: np.ndarray, close_imp_home: np.ndarray,
                  threshold: float) -> dict:
@@ -94,14 +100,153 @@ def run_strategy(p_home: np.ndarray, odds_home: np.ndarray, odds_away: np.ndarra
     return out
 
 
+def run_strategy_3way(p_mat: np.ndarray, o_mat: np.ndarray, y_mat: np.ndarray,
+                      close_mat: np.ndarray, threshold: float) -> dict:
+    """足球 1X2 flat 1u:argmax(p) >= threshold 才下注,買進價 = 該結果開盤賠率。
+
+    p_mat/o_mat/close_mat: [N,3] (主,和,客);y_mat: [N,3] one-hot。
+    """
+    n = len(p_mat)
+    p_mat = np.atleast_2d(p_mat); o_mat = np.atleast_2d(o_mat)
+    y_mat = np.atleast_2d(y_mat); close_mat = np.atleast_2d(close_mat)
+    side = p_mat.argmax(1)
+    conf = p_mat.max(1)
+    take = conf >= threshold
+    bet = take.astype(int)
+    idx = np.where(bet)[0]
+    out = {"n_bets": int(len(idx)), "skipped": int(n - len(idx))}
+    o_bet = o_mat[np.arange(n), side]
+    p_bet = conf
+    win = (y_mat[np.arange(n), side] == 1).astype(float)
+    profit_full = np.where(bet != 0, np.where(win == 1, o_bet - 1.0, -1.0), 0.0)
+    out["_profit"] = np.cumsum(profit_full)
+    if len(idx) == 0:
+        out.update(hit_rate=None, roi=None, clv=None, max_consec_loss=0,
+                   max_drawdown=0.0, avg_kelly=None)
+        return out
+    o, pb, w = o_bet[idx], p_bet[idx], win[idx]
+    profit = profit_full[idx]
+    close_bet = close_mat[np.arange(n), side][idx]
+    kelly = np.clip((pb * o - 1.0) / (o - 1.0), 0.0, 0.25)
+    max_streak, cur = 0, 0
+    for w_ in profit:
+        cur = cur + 1 if w_ < 0 else 0
+        max_streak = max(max_streak, cur)
+    cum_full = out["_profit"]
+    peak_full = np.maximum.accumulate(np.concatenate([[0.0], cum_full]))[1:]
+    dd_full = peak_full - cum_full
+    out.update(
+        hit_rate=float(w.mean()),
+        roi=float(profit.mean()),
+        clv=float((pb - close_bet).mean()),
+        max_consec_loss=int(max_streak),
+        max_drawdown=float(dd_full.max()),
+        avg_kelly=float(kelly.mean()),
+        net_profit=float(profit.sum()),
+    )
+    return out
+
+
+def main_soccer(args) -> None:
+    """足球 1X2 回測:preds csv 需有 p_home/p_draw/p_away + 1X2 開/收盤賠率 + outcome。"""
+    preds = pd.read_csv(args.preds)
+    if "outcome" in preds.columns:
+        y_all = preds["outcome"].astype(int).values
+    else:
+        raise SystemExit("soccer preds 需要 outcome 欄(0=主 1=和 2=客)")
+    d = preds.sort_values("date").reset_index(drop=True)
+    n = len(d)
+
+    def _mats(prefix_p, prefix_o):
+        p = d[[prefix_p + s for s in ("_home", "_draw", "_away")]].astype(float).values
+        o = d[[prefix_o + s for s in ("_home", "_draw", "_away")]].astype(float).values
+        return p, o
+
+    p_m, o_open = _mats("p", "open_ml")
+    _, o_close = _mats("p", "close_ml")
+    c_open = implied_3way(o_open)
+    c_close = implied_3way(o_close)
+    y = np.zeros((n, 3)); y[np.arange(n), y_all] = 1.0
+
+    model = run_strategy_3way(p_m, o_open, y, c_close, args.threshold)
+    market = run_strategy_3way(c_open, o_open, y, c_close, args.threshold)
+    scan = []
+    for t in np.arange(0.45, 0.651, 0.025):
+        t = round(float(t), 3)
+        res = run_strategy_3way(p_m, o_open, y, c_close, t)
+        scan.append({"threshold": t, "n_bets": res["n_bets"],
+                     "roi": None if res["roi"] is None else round(res["roi"], 4),
+                     "hit_rate": None if res["hit_rate"] is None else round(res["hit_rate"], 4)})
+    report = {
+        "sport": "soccer",
+        "n_games": n,
+        "threshold": args.threshold,
+        "note": "flat 1u,下注價=開盤 1X2 賠率;CLV>0 表示價格贏過收盤市場",
+        "model": {k: v for k, v in model.items() if k != "_profit"},
+        "market_open": {k: v for k, v in market.items() if k != "_profit"},
+        "threshold_scan": scan,
+    }
+    os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
+    with open(args.report, "w", encoding="utf-8") as f:
+        json.dump(report, f, ensure_ascii=False, indent=2)
+
+    def f3(v, nd=4):
+        return f"{v:.{nd}f}" if v is not None else "n/a"
+
+    print(f"\ngames={n}  threshold={args.threshold}  (soccer 1X2)")
+    print(f"{'line':<14}{'bets':>6}{'hit':>8}{'ROI':>9}{'CLV':>9}{'maxDD':>8}{'連敗':>6}{'Kelly':>8}")
+    for name in ("model", "market_open"):
+        r = report[name]
+        print(f"{name:<14}{r['n_bets']:>6}{f3(r['hit_rate'], 3):>8}{f3(r['roi']):>9}"
+              f"{f3(r['clv']):>9}{f3(r['max_drawdown'], 1):>8}{r['max_consec_loss']:>6}"
+              f"{f3(r['avg_kelly'], 3):>8}")
+    print("\nthreshold scan (model, on max outcome prob):")
+    print(f"{'thr':>6}{'bets':>7}{'ROI':>9}{'hit':>8}")
+    for s in scan:
+        print(f"{s['threshold']:>6.3f}{s['n_bets']:>7}{str(f3(s['roi'])):>9}{str(f3(s['hit_rate'], 3)):>8}")
+    print(f"\nreport -> {args.report}")
+
+    if args.plot:
+        import matplotlib
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(11, 4.5))
+        if n > 0:
+            x = np.arange(n)
+            ax1.plot(x, model["_profit"], label="model", lw=1.5)
+            ax1.plot(x, market["_profit"], label="market_open", lw=1.2, alpha=0.8)
+            ax1.axhline(0, color="k", lw=0.8)
+            ax1.set_title("Cumulative profit (flat 1u, 1X2 @ open odds)")
+            ax1.set_xlabel("game index (chronological)")
+            ax1.legend(); ax1.grid(alpha=0.3)
+            thr = [s["threshold"] for s in scan]
+            roi = [s["roi"] if s["roi"] is not None else np.nan for s in scan]
+            ax2.plot(thr, roi, "o-")
+            ax2.axhline(0, color="k", lw=0.8)
+            ax2.set_title("ROI by threshold (model)")
+            ax2.set_xlabel("max-prob threshold")
+            ax2.grid(alpha=0.3)
+        os.makedirs(os.path.dirname(args.plot) or ".", exist_ok=True)
+        fig.tight_layout()
+        fig.savefig(args.plot, dpi=120)
+        print(f"plot   -> {args.plot}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--preds", required=True, help="evaluate.py --pred-out 的 csv")
     ap.add_argument("--matches-csv", required=True)
-    ap.add_argument("--threshold", type=float, default=0.55)
+    ap.add_argument("--sport", choices=("basketball", "soccer"), default="basketball")
+    ap.add_argument("--threshold", type=float, default=None,
+                    help="預設 0.55(soccer 1X2 建議 0.50~0.60)")
     ap.add_argument("--report", default="output/backtest.json")
     ap.add_argument("--plot", default=None)
     args = ap.parse_args()
+    if args.threshold is None:
+        args.threshold = 0.55
+    if args.sport == "soccer":
+        return main_soccer(args)
 
     preds = pd.read_csv(args.preds)
     df = pd.read_csv(args.matches_csv)

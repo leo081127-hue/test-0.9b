@@ -146,3 +146,38 @@ def test_reward_components_range_and_garbage():
     assert 0.0 <= comp["brier"] <= 1.0
     assert comp["direction"] in (0.0, 0.5)
     assert 0.0 <= comp["cover"] <= 0.3
+
+
+# ------------------------------------------------------------- soccer 1X2
+
+GOOD_S = "最終預測: 主隊\n機率: 主隊 0.45, 和局 0.25, 客隊 0.30"
+
+
+def test_reward_soccer_correct_side():
+    r = make_reward()
+    s = r(prompts=["p"], completions=[GOOD_S], sport=["soccer"], outcome=[0])
+    # +1 格式 + 1-(0.55²+0.25²+0.3²) 多類 Brier + 0.5 方向
+    expect = 1.0 + (1 - (0.55 ** 2 + 0.25 ** 2 + 0.3 ** 2)) + 0.5
+    assert s[0] == pytest.approx(expect, abs=1e-9)
+
+
+def test_reward_soccer_wrong_side_and_draw():
+    r = make_reward()
+    # 押主但客贏:方向 0
+    s = r(prompts=["p"], completions=[GOOD_S], sport=["soccer"], outcome=[2])
+    expect = 1.0 + (1 - (0.45 ** 2 + 0.25 ** 2 + 0.7 ** 2)) + 0.0
+    assert s[0] == pytest.approx(expect, abs=1e-9)
+    assert s[0] < 2.0  # 錯方向一定低於對方向的同機率分數
+    # 和局對:「最終預測: 和局」
+    draw = "最終預測: 和局\n機率: 主隊 0.30, 和局 0.40, 客隊 0.30"
+    s2 = r(prompts=["p"], completions=[draw], sport=["soccer"], outcome=[1])
+    # y=和:平方誤差 = (0.3-0)² + (0.4-1)² + (0.3-0)² = 0.54
+    expect2 = 1.0 + (1 - (0.3 ** 2 + (0.4 - 1) ** 2 + 0.3 ** 2)) + 0.5
+    assert s2[0] == pytest.approx(expect2, abs=1e-9)
+    assert s2[0] > s[0]
+
+
+def test_reward_soccer_garbage_and_missing_labels():
+    r = make_reward()
+    assert r(prompts=["p"], completions=["亂碼"], sport=["soccer"], outcome=[0])[0] == 0.0
+    assert r(prompts=["p"], completions=[GOOD_S]) is None  # 無 outcome → None

@@ -31,6 +31,31 @@
 
 範例:`data/examples/matches_sample.csv`
 
+## 足球(sport = soccer,1X2 三結果)
+
+足球走「主勝 / 和 / 客勝」三結果路線(v1 不輸出让分覆蓋)。欄位差異:
+
+| 欄位 | 說明 |
+|---|---|
+| `home_win` | 主隊是否**贏**(平局 = 0);三結果由 `margin` 決定:>0 主勝、=0 和、<0 客勝 |
+| `open_ml_draw` / `close_ml_draw` | **必填**:1X2 的和局賠率(十進位)。有這欄 pipeline 自動走 soccer 路徑 |
+| `home_form_d` / `away_form_d` | 近 10 場平局數(籃球留空) |
+| `home_record` / `away_record` | 用 `W-D-L` 格式(如 `10-4-6`) |
+| `open_spread` / `close_spread` / totals | v1 不需要,留空(NaN) |
+
+`home_avg_pts` 在足球 = 平均每場進球數。
+
+```bash
+python data/generate_demo_soccer.py --seasons 5 --games-per-season 200 --out data/demo/soccer.csv
+python data/build_dataset.py --matches data/demo/soccer.csv --out data/out_soccer --sport soccer
+python eval/evaluate.py ... --sport soccer                        # 三結果 acc/Brier/LogLoss
+python eval/backtest.py ... --sport soccer                         # 1X2 flat 1u 回測 + CLV
+```
+
+統計核心:`data/generate_demo_soccer.py` 用 bivariate Poisson + Dixon-Coles(1997)
+低分修正(κ=0.10 放大 0-0/1-1、壓縮 1-0/0-1)+ 主場優勢;~25% 賽事開盤誤價、
+收盤修正 75%(讓 teacher/模型有可學的 edge,market close 依然是強 baseline)。
+
 ## 合成 demo 資料
 
 `python data/generate_demo_data.py` 產生籃球風格的假資料(含開/收盤、賠率、狀態特徵、~25% 盤口誤價與盤口看不到的休息天數效應,讓模型有可學的 edge)。

@@ -30,11 +30,27 @@ OPT_FEATURES = [
 ]
 
 
+REQUIRED_SOCCER = [
+    "match_id", "date", "season", "home", "away",
+    "home_score", "away_score", "home_win", "margin",
+    "open_ml_home", "open_ml_draw", "open_ml_away",
+    "close_ml_home", "close_ml_draw", "close_ml_away",
+]
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--matches", required=True)
+    ap.add_argument("--sport", choices=("basketball", "soccer", "auto"), default="auto")
     ap.add_argument("--json", default=None, help="輸出 JSON 報告路徑")
     args = ap.parse_args()
+
+    df = pd.read_csv(args.matches)
+    sport = args.sport
+    if sport == "auto":
+        sport = "soccer" if "open_ml_draw" in df.columns else "basketball"
+    required = REQUIRED_SOCCER if sport == "soccer" else REQUIRED
+    print(f"sport: {sport}")
 
     issues: list[dict] = []
 
@@ -44,11 +60,10 @@ def main() -> None:
     def warn(check: str, msg: str):
         issues.append({"severity": "WARN", "check": check, "message": msg})
 
-    df = pd.read_csv(args.matches)
     print(f"loaded {len(df)} rows, {len(df.columns)} columns")
 
     # ---- 必要欄位 ----
-    missing_cols = [c for c in REQUIRED if c not in df.columns]
+    missing_cols = [c for c in required if c not in df.columns]
     if missing_cols:
         error("required_columns", f"缺少必要欄位: {missing_cols}")
     if missing_cols:
@@ -85,14 +100,32 @@ def main() -> None:
             error("win_consistency", f"{bad_w} 筆 home_win 與 margin 矛盾")
         if (df["home_score"] < 0).any() or (df["away_score"] < 0).any():
             error("negative_score", "有負數比分")
+    if sport == "soccer" and "home_score" in df.columns:
+        hs = pd.to_numeric(df["home_score"], errors="coerce")
+        bad_i = int(((hs != hs.round()) | hs.isna()).sum())
+        if bad_i:
+            error("goals_not_int", f"{bad_i} 筆進球數不是整數(足球)")
 
     # ---- 賠率 ----
-    for col in ("open_ml_home", "open_ml_away", "close_ml_home", "close_ml_away"):
+    ml_cols = ("open_ml_home", "open_ml_away", "close_ml_home", "close_ml_away")
+    if sport == "soccer":
+        ml_cols = ml_cols + ("open_ml_draw", "close_ml_draw")
+    for col in ml_cols:
         if col in df.columns:
             n_low = int((df[col] <= 1.01).sum())
             if n_low:
                 error(f"odds_low:{col}", f"{n_low} 筆賠率 <= 1.01")
-    if all(c in df.columns for c in ("open_ml_home", "open_ml_away", "close_ml_home", "close_ml_away")):
+    if sport == "soccer" and all(f"{t}_ml_draw" in df.columns for t in ("open", "close")):
+        for tag in ("open", "close"):
+            vig = (1 / df[f"{tag}_ml_home"] + 1 / df[f"{tag}_ml_draw"]
+                   + 1 / df[f"{tag}_ml_away"])
+            n_bad = int(((vig < 0.95) | (vig > 1.35)).sum())
+            if n_bad:
+                warn(f"vig_{tag}", f"{n_bad} 筆 1X2 vig 超出 [0.95, 1.35]( {vig.min():.3f}~{vig.max():.3f} )")
+            else:
+                print(f"vig {tag} (1X2): {vig.min():.3f} ~ {vig.max():.3f} (ok)")
+    elif all(c in df.columns for c in ("open_ml_home", "open_ml_away",
+                                       "close_ml_home", "close_ml_away")):
         for tag, cols in (("open", ("open_ml_home", "open_ml_away")),
                           ("close", ("close_ml_home", "close_ml_away"))):
             vig = 1 / df[cols[0]] + 1 / df[cols[1]]
@@ -102,21 +135,28 @@ def main() -> None:
             else:
                 print(f"vig {tag}: {vig.min():.3f} ~ {vig.max():.3f} (ok)")
 
-    # ---- 讓分覆蓋率 ----
-    if all(c in df.columns for c in ("margin", "close_spread")):
+    # ---- 讓分覆蓋率(足球 v1 無讓分 → 跳過)----
+    if all(c in df.columns for c in ("margin", "close_spread")) and df["close_spread"].notna().any():
         cov = (df["margin"] > df["close_spread"]).mean()
         if not (0.40 <= cov <= 0.60):
             warn("cover_rate", f"收盤讓分覆蓋率 {cov:.3f} 偏離 0.50 太多(盤口慣例或標籤問題?)")
         else:
             print(f"home cover rate (close): {cov:.3f} (ok)")
 
-    # ---- 主隊勝率 ----
+    # ---- 主隊勝率 / 足球 1X2 基率 ----
     if "home_win" in df.columns:
         hw = df["home_win"].mean()
-        if not (0.35 <= hw <= 0.70):
-            warn("home_win_rate", f"主隊勝率 {hw:.3f} 異常(籃球通常 0.5~0.65)")
+        lo, hi = (0.35, 0.70) if sport != "soccer" else (0.30, 0.55)
+        if not (lo <= hw <= hi):
+            warn("home_win_rate", f"主隊勝率 {hw:.3f} 異常({sport} 常見 {lo:.2f}~{hi:.2f})")
         else:
             print(f"home win rate: {hw:.3f} (ok)")
+    if sport == "soccer" and "margin" in df.columns:
+        dr = (df["margin"] == 0).mean()
+        if not (0.15 <= dr <= 0.40):
+            warn("draw_rate", f"和局率 {dr:.3f} 異常(足球常見 0.20~0.32)")
+        else:
+            print(f"draw rate: {dr:.3f} (ok)")
 
     # ---- 特徵缺漏 ----
     for col in OPT_FEATURES:
@@ -125,9 +165,14 @@ def main() -> None:
             if na > 0.20:
                 warn(f"feature_na:{col}", f"缺漏率 {na:.1%}")
     if "home_form_w" in df.columns and "home_form_l" in df.columns:
-        bad = int(((df["home_form_w"] + df["home_form_l"]) > 10).sum())
+        s_h = df["home_form_w"].fillna(0) + df["home_form_l"].fillna(0)
+        s_a = df["away_form_w"].fillna(0) + df["away_form_l"].fillna(0)
+        if sport == "soccer":
+            s_h = s_h + df["home_form_d"].fillna(0) if "home_form_d" in df.columns else s_h
+            s_a = s_a + df["away_form_d"].fillna(0) if "away_form_d" in df.columns else s_a
+        bad = int(((s_h > 10) | (s_a > 10)).sum())
         if bad:
-            warn("form_window", f"{bad} 筆近10場勝+負 > 10")
+            warn("form_window", f"{bad} 筆近10場(勝+平+負) > 10")
 
     # ---- 輸出 ----
     n_err = sum(1 for i in issues if i["severity"] == "ERROR")

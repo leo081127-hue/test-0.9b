@@ -80,17 +80,52 @@ def reward_components(text, y_home, y_cover=None):
     return comp
 
 
+def reward_components_soccer(text, y):
+    """足球 1X2 單個 completion 的分項(0=主勝 1=和 2=客勝)。
+
+    format:  +1.0  解析出三結果機率行
+    brier:   1 - Σ(p_i - y_i)²   (多類 Brier 的 1- 形式,範圍 0..1)
+    direction: +0.5  argmax 方向正確
+    """
+    if isinstance(text, (bytes, bytearray)):
+        text = text.decode("utf-8", errors="ignore")
+    p = parse_response(str(text), "soccer")
+    comp = {"format": 0.0, "brier": 0.0, "direction": 0.0, "cover": 0.0}
+    if p["format_ok"] and p["p_home"] is not None:
+        yv = [0.0, 0.0, 0.0]
+        yv[int(y)] = 1.0
+        comp["format"] = 1.0
+        comp["brier"] = 1.0 - (p["p_home"] - yv[0]) ** 2 - (p["p_draw"] - yv[1]) ** 2 \
+            - (p["p_away"] - yv[2]) ** 2
+        from common import OUTCOME_LABELS
+        comp["direction"] = 0.5 if p["pred"] == OUTCOME_LABELS[int(y)] else 0.0
+    return comp
+
+
 def make_reward():
-    """TRL 1.x reward function。
+    """TRL 1.x reward function(支援 basketball 二結果與 soccer 1X2)。
 
     TRL 以關鍵字呼叫:reward_func(prompts=..., completions=..., completion_ids=...,
     **dataset 額外欄位)→ 回傳 list[float](每個 completion 一個分數)。
     """
 
     def reward(prompts=None, completions=None, completion_ids=None,
-               outcome_home=None, cover_home=None, **_kw):
-        if completions is None or outcome_home is None:
+               outcome_home=None, cover_home=None, outcome=None, sport=None, **_kw):
+        if completions is None:
             return None  # TRL 會以 NaN 處理並警告
+        is_soccer = any(s == "soccer" for s in (sport if isinstance(sport, list) else [])) \
+            or (sport == "soccer") or (outcome is not None and outcome_home is None)
+        if is_soccer:
+            if outcome is None:
+                return None
+            ys = outcome if isinstance(outcome, list) else [outcome] * len(completions)
+            out = []
+            for text, y in zip(completions, ys):
+                comp = reward_components_soccer(text, float(y))
+                out.append(comp["format"] + comp["brier"] + comp["direction"] + comp["cover"])
+            return out
+        if outcome_home is None:
+            return None
         out = []
         ys = outcome_home if isinstance(outcome_home, list) else [outcome_home]
         cs = cover_home if isinstance(cover_home, list) else ([cover_home] * len(ys))
@@ -130,13 +165,19 @@ def run_audit(model, tok, rows, n=20, max_new=128):
     seq_len = inputs["input_ids"].shape[1]
     texts = [tok.decode(ids[j][seq_len:], skip_special_tokens=True) for j in range(len(rows))]
     tot = {"format": 0.0, "brier": 0.0, "direction": 0.0, "cover": 0.0}
+    sport = "soccer" if rows and rows[0].get("sport") == "soccer" else "basketball"
     for text, r in zip(texts, rows):
-        comp = reward_components(text, float(r["outcome_home"]), float(r["cover_home"]))
+        if sport == "soccer":
+            comp = reward_components_soccer(text, float(r["outcome"]))
+        else:
+            comp = reward_components(text, float(r["outcome_home"]),
+                                     r.get("cover_home"))
         for k in tot:
             tot[k] += comp[k]
     k = len(rows)
     return {
         "n": k,
+        "sport": sport,
         "reward_mean": (tot["format"] + tot["brier"] + tot["direction"] + tot["cover"]) / k,
         "format_rate": tot["format"] / k,
         "brier_mean": tot["brier"] / k,
@@ -176,11 +217,14 @@ def main() -> None:
     with open(args.train_jsonl, encoding="utf-8") as f:
         for line in f:
             d = json.loads(line)
-            rows.append({
-                "prompt": d["prompt"],
-                "outcome_home": int(d["outcome_home"]),
-                "cover_home": int(d["cover_home"]),
-            })
+            row = {"prompt": d["prompt"]}
+            if d.get("sport") == "soccer" or "outcome" in d:
+                row["sport"] = "soccer"
+                row["outcome"] = int(d["outcome"])
+            else:
+                row["outcome_home"] = int(d["outcome_home"])
+                row["cover_home"] = int(d["cover_home"])
+            rows.append(row)
     if args.num_generations > 1 and len(rows) % args.num_generations:
         pad = args.num_generations - len(rows) % args.num_generations
         rows += rows[:pad]
