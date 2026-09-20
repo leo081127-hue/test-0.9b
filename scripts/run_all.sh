@@ -43,11 +43,21 @@ $PY train/dpo.py $EXTRA_ARGS \
   --output-dir output/dpo --epochs 1 --lr 5e-5
 
 if [ "$USE_GRPO" = "1" ]; then
-  echo "==> [4.5/5] GRPO (RL,reward = Brier + 格式)"
+  echo "==> [4.5/6] GRPO (RL,reward = Brier + 格式)"
+  # RL 準備度審計:訓練前基線(格式率/Brier/方向/覆蓋各差多少)
+  $PY train/grpo.py $EXTRA_ARGS \
+    --model-id "$MODEL_ID" --adapter-dir output/dpo \
+    --train-jsonl data/out/train.jsonl \
+    --reward-audit --audit-n 50 --audit-out output/reward_audit_before.json
   $PY train/grpo.py $EXTRA_ARGS \
     --model-id "$MODEL_ID" \
     --train-jsonl data/out/train.jsonl --adapter-dir output/dpo \
     --output-dir output/grpo --num-generations 8 --batch-size 8 --max-completion 512
+  # 訓練後:與 before 比較 reward_mean(必須真的上升,而非只改格式)
+  $PY train/grpo.py $EXTRA_ARGS \
+    --model-id "$MODEL_ID" --adapter-dir output/grpo \
+    --train-jsonl data/out/train.jsonl \
+    --reward-audit --audit-n 50 --audit-out output/reward_audit_after.json
   FINAL_ADAPTER=output/grpo
 fi
 

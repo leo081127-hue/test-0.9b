@@ -137,8 +137,32 @@ bash scripts/smoke_test.sh
 - 這與 K2-Horizon 自己的訓練路線一致(它的 math/code 專家都是 GRPO 練出來再 merge)。
 - 需 `pip install trl datasets`;腳本已對 **TRL 1.x 的 GRPOTrainer API 實跑驗證**
   (reward 函數簽名、`datasets.Dataset`、batch 整除限制)。
-- ⚠️ TRL 1.x 要求 `--batch-size` 能被 `--num-generations` 整除(如 8×2、16×8)。
+- ⚠️ TRL 1.x 要求 `--batch-size` 能被 `--num-generations` 整除(如 8×2、16×8);
+  資料行數不能被 `--num-generations` 整除時腳本會**自動 pad** 並印出警告。
 - 0.9B + `--num-generations 8` 建議 24GB 顯存;8GB 用 `--num-generations 2 --batch-size 2`。
+
+#### RL 準備度審計(`--reward-audit`):確認 RL 真的有用
+
+GRPO 的梯度訊號來自**同一 prompt 的群組內 reward 差異**。若模型連格式都輸出不出來
+(reward 全 0),群組方差 = 0,RL 什麼都學不到(log 會顯示
+`frac_reward_zero_std: 1`)。所以正式流程是:
+
+```bash
+# 1) SFT(+DPO)後,先量「RL 前」基線:格式率/Brier/方向/覆蓋各差多少
+python train/grpo.py $EXTRA_ARGS --model-id "$MODEL_ID" --adapter-dir output/dpo \
+    --train-jsonl data/out/train.jsonl --reward-audit --audit-n 50 \
+    --audit-out output/reward_audit_before.json
+# 2) 跑 GRPO 訓練
+python train/grpo.py $EXTRA_ARGS --model-id "$MODEL_ID" --adapter-dir output/dpo \
+    --train-jsonl data/out/train.jsonl --output-dir output/grpo \
+    --num-generations 8 --batch-size 8
+# 3) 再量「RL 後」:reward_mean 必須上升(且不是只靠 format_rate 上升)
+python train/grpo.py $EXTRA_ARGS --model-id "$MODEL_ID" --adapter-dir output/grpo \
+    --train-jsonl data/out/train.jsonl --reward-audit --audit-n 50 \
+    --audit-out output/reward_audit_after.json
+```
+
+`run_all.sh`(USE_GRPO=1)已自動串好這三步。
 
 ### 部署:`tools/merge_adapter.py`
 把 LoRA 合併進基座 → 標準 HF 目錄,直接給 vLLM/SGLang 用:
@@ -188,6 +212,7 @@ vllm serve output/dpo_merged --trust-remote-code --dtype bfloat16 --reasoning-pa
 | parse_error_rate 高 | 調大 `--max-new-tokens`(預設 384)、確認用對 adapter;推理用 `temperature=0` |
 | GRPO 報 `generation_batch_size ... divisible by num_generations` | TRL 1.x 限制:`--batch-size` 要能被 `--num-generations` 整除(如 2/2、8/8、16/8) |
 | GRPO 報 `train_dataset must be a Dataset` | 腳本已用 `datasets.Dataset.from_list`;若改動資料輸入,記得保持該轉換 |
+| GRPO log 顯示 `frac_reward_zero_std: 1`、reward 全 0 | **reward 饑餓**:模型輸出解析不出格式 → 群組內無差異、RL 無訊號。先跑 `--reward-audit` 看 `format_rate`;通常代表 SFT 沒學好(加 epoch/查 val loss)或 `--max-completion` 太短 |
 | val loss 下降但 test 贏不了 market | 正常!檢查是否資料太少/盤口品質差;先確認 LogReg baseline 本身能否贏 market(它贏不了,LLM 更難) |
 | 想加速推論 | vLLM serve(見 K2-Horizon model card 的 quickstart),adapter 合併後部署 |
 
@@ -221,19 +246,27 @@ scripts/smoke_test.sh        # CPU smoke(無 GPU 也能跑)
 
 ```bash
 pip install -r requirements-dev.txt
-python -m pytest tests/ -q          # 全部(含整合管線,2 核 CPU 約 4~5 分鐘)
-python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 15 秒)
+python -m pytest tests/ -q          # 全部(含整合管線,2 核 CPU 約 5~6 分鐘)
+python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 30 秒)
 ```
 
-覆蓋:
+覆蓋(11 個檔、80 項):
 - `test_common.py` — prompt/回應格式、解析(含全形符號、未加和為 1 的正規化)、Brier/LogLoss/ECE、特徵矩陣
 - `test_generate.py` — 生成器確定性、時間序列不變量、**近10場/對決特徵不用未來資料**、盤口區隔度(AUC>0.6)
 - `test_build_dataset.py` — 時間切分無反序、jsonl schema、回應機率 == teacher 值、DPO pairs 方向扭曲
 - `test_dpo_ref.py` — DPO 的「disable adapter == base」reference 技巧的數值正確性
-- `test_grpo_reward.py` — GRPO reward 分數手算驗證(格式/Brier/方向/覆蓋)
+- `test_dpo_learning.py` — **DPO 行為測試**:偏好學習真的發生(loss 下降、chosen 隱含優勢變大、policy 更偏好 chosen)
+- `test_grpo_reward.py` — GRPO reward 手算驗證(格式/Brier/方向/覆蓋)+ 11 個解析健壯性邊緣案例
+  (正規化、全形符號、極端機率、0/0 拒判、batch、bytes、分項加總一致性)
+- `test_grpo_rl.py` — **GRPO 行為測試**:reward 光譜單調性(有訊號)、trainer log 指標有限無 NaN、
+  reward 饑餓(群組方差=0)時數值穩定、rows 自動 pad、`run_audit` 與手算分項一致
 - `test_backtest.py` — ROI/CLV/drawdown/連敗 手算案例 + 門檻邊界
 - `test_qa.py` — 乾淨資料 0 error;重複 id/矛盾標籤/壞賠率要被抓出來
 - `test_pipeline.py` — 整合:generate→build→tiny→SFT(含 val)→DPO→**GRPO**→評估→推論(csv+json 兩路)→**merge 部署**
+
+> RL 測試的誠實邊界:CPU 上隨機初始化的 tiny 模型學不會輸出格式(reward 全 0、群組方差 0),
+> 所以套件不斷言「GRPO 一定提升 reward」——那需要 GPU + 已 SFT 的模型,流程見 §6
+> 「RL 準備度審計(`--reward-audit`)」小節。
 
 ## 11. Roadmap(還沒做)
 

@@ -15,7 +15,7 @@ import argparse
 import json
 import os
 
-from tokenizers import Tokenizer, models as tmodels, pre_tokenizers, trainers as ttrainers
+from tokenizers import Tokenizer, models as tmodels, pre_tokenizers, trainers as ttrainers, decoders
 from transformers import LlamaConfig, LlamaForCausalLM, PreTrainedTokenizerFast
 
 CHAT_TEMPLATE = (
@@ -51,6 +51,9 @@ def main() -> None:
 
     tok = Tokenizer(tmodels.BPE(unk_token="<unk>"))
     tok.pre_tokenizer = pre_tokenizers.ByteLevel()
+    # 關鍵:ByteLevel BPE 的 decode 必須還原 byte-level 字元 → UTF-8,
+    # 否則 decode 回亂碼,任何「模型輸出解析」(評估/推論/GRPO reward)都會失敗。
+    tok.decoder = decoders.ByteLevel()
     trainer = ttrainers.BpeTrainer(
         vocab_size=args.vocab,
         special_tokens=["<unk>", "<pad>", "<bos>", "<eos>",
