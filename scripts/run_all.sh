@@ -17,21 +17,26 @@ USE_GRPO="${USE_GRPO:-0}"
 
 FINAL_ADAPTER=output/dpo
 
-echo "==> [1/5] demo 資料(有真實資料時設定 MATCHES=你的csv)"
+echo "==> [0/6] 資料品質檢查"
+if [ -f "$MATCHES" ]; then
+  $PY data/qa_report.py --matches "$MATCHES" --json output/qa.json || true
+fi
+
+echo "==> [1/6] demo 資料(有真實資料時設定 MATCHES=你的csv)"
 if [ ! -f "$MATCHES" ]; then
   $PY data/generate_demo_data.py --out "$MATCHES"
 fi
 
-echo "==> [2/5] 建立 SFT / DPO 資料"
+echo "==> [2/6] 建立 SFT / DPO 資料"
 $PY data/build_dataset.py --matches "$MATCHES" --out data/out
 
-echo "==> [3/5] SFT (LoRA)"
+echo "==> [3/6] SFT (LoRA)"
 $PY train/sft.py $EXTRA_ARGS \
   --model-id "$MODEL_ID" \
   --train-jsonl data/out/train.jsonl --val-jsonl data/out/val.jsonl \
   --adapter-dir output/sft --epochs 3 --batch-size 4 --grad-accum 4
 
-echo "==> [4/5] DPO"
+echo "==> [4/6] DPO"
 $PY train/dpo.py $EXTRA_ARGS \
   --model-id "$MODEL_ID" \
   --adapter-dir output/sft --pairs data/out/dpo_pairs.jsonl \
@@ -46,11 +51,19 @@ if [ "$USE_GRPO" = "1" ]; then
   FINAL_ADAPTER=output/grpo
 fi
 
-echo "==> [5/5] 評估"
+echo "==> [5/6] 評估"
 $PY eval/evaluate.py $EXTRA_ARGS \
   --model-id "$MODEL_ID" --adapter-dir "$FINAL_ADAPTER" \
   --test-jsonl data/out/test.jsonl --matches-csv "$MATCHES" \
-  --report output/report.json --plot output/calibration.png
+  --report output/report.json --plot output/calibration.png \
+  --pred-out output/preds.csv
 
-echo "done. report: output/report.json (adapter: $FINAL_ADAPTER)"
+echo "==> [6/6] 回測(ROI / CLV / drawdown)"
+$PY eval/backtest.py \
+  --preds output/preds.csv --matches-csv "$MATCHES" \
+  --threshold 0.55 --report output/backtest.json --plot output/equity.png
+
+echo "done."
+echo "  report  : output/report.json (adapter: $FINAL_ADAPTER)"
+echo "  backtest: output/backtest.json + output/equity.png"
 echo "部署: python tools/merge_adapter.py --model-id $MODEL_ID $EXTRA_ARGS --adapter-dir $FINAL_ADAPTER --out-dir output/merged"

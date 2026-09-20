@@ -142,6 +142,22 @@ def test_predict_output(pipeline):
     assert "解析結果" in log
 
 
+def test_predict_features_json(pipeline):
+    """--features-json 路徑(新賽事推論的正式輸入方式)。"""
+    import pandas as pd
+
+    tmp = pipeline["tmp"]
+    d = pd.read_csv(tmp / "matches.csv").iloc[50].to_dict()
+    j = tmp / "game.json"
+    j.write_text(json.dumps(d, default=str), encoding="utf-8")
+    log = run("predict_json", "infer/predict.py",
+              "--model-id", tmp / "tiny", "--dtype", "float32",
+              "--adapter-dir", pipeline["dpo_dir"],
+              "--features-json", j, "--max-new-tokens", "64")
+    assert "模型輸出" in log
+    assert "解析結果" in log
+
+
 def test_merged_model_deployment_ready(pipeline):
     d = pipeline["merged"]
     assert (d / "config.json").exists()

@@ -70,7 +70,19 @@ export MODEL_ID=IFM/K2-Horizon-0.9B           # 預設值
 export EXTRA_ARGS="--trust-remote-code"       # K2-Horizon 需要;換 Qwen 就留空
 
 bash scripts/run_all.sh
-# 輸出: output/sft、output/dpo、output/report.json、output/calibration.png
+# 輸出: output/sft、output/dpo、output/report.json、output/calibration.png、
+#       output/preds.csv、output/backtest.json、output/equity.png
+```
+
+### 沒有 GPU?用 Colab
+
+`colab/sport_predict_colab.ipynb`:開 Colab → 上傳/打開這個 notebook → 填入你的 repo
+URL → 跑(免費 T4 可跑 SFT+DPO+評估;GRPO 建議 A100)。
+
+### 你的真實資料開跑前
+
+```bash
+python data/qa_report.py --matches 你的資料.csv   # 重複 id/比分矛盾/賠率 vig/覆蓋率…
 ```
 
 ### 單筆新賽事預測
@@ -152,6 +164,21 @@ vllm serve output/dpo_merged --trust-remote-code --dtype bfloat16 --reasoning-pa
 另外 `report["by_season"]` 給**分季** LLM vs Market 的 acc/brier,看模型在更晚的賽季
 (時間外推)是否退化——體育模型最怕這個。
 
+### 回測:`eval/backtest.py`(贏錢了嗎?)
+
+`evaluate.py --pred-out` 會把逐筆模型機率 + 開/收盤賠率匯出 CSV;backtest 用
+「|p-0.5| ≥ 門檻才下注、flat 1u、買進價=開盤賠率」的策略算:
+
+| 指標 | 意義 |
+|---|---|
+| ROI | 每下注一場的期望獲利(flat 1u) |
+| **CLV** | 下注方機率 vs 收盤市場隱含機率的平均差。**> 0 才是長期可贏的訊號**(價格贏過收盤市場) |
+| max_drawdown / 連敗 | 資金曲線的最大回撤與最長連敗(能不能撐得住) |
+| 門檻掃描 | 0.50~0.70 各門檻的 bets/ROI(選你的下注風格) |
+
+會同時跑 **market_open** 基準線(賭場開盤價去抽水後下注)做對照——
+它的 CLV 理論上 ≈ 0,可用來 sanity check。
+
 ## 8. 故障排除
 
 | 症狀 | 解法 |
@@ -177,10 +204,13 @@ train/
   sft.py                     # LoRA SFT(主)
   dpo.py                     # DPO(選用)
   grpo.py                    # GRPO RL(選用,需 trl)
-eval/evaluate.py             # 評估 + baseline 對照 + 分季統計 + report.json + calibration.png
+eval/evaluate.py             # 評估 + baseline 對照 + 分季統計 + report.json + calibration.png + pred-out
+eval/backtest.py             # 回測:ROI / CLV / drawdown / 門檻掃描(對照 market_open)
+data/qa_report.py            # 真實資料訓練前品質檢查(重複 id/矛盾標籤/vig/…)
 infer/predict.py             # 單筆預測 CLI
 tools/smoke_tiny_model.py    # 本地 tiny 模型(無網路 smoke test 用)
 tools/merge_adapter.py       # LoRA 合併進基座 → vLLM/SGLang 部署
+colab/sport_predict_colab.ipynb  # Colab 訓練 notebook
 tests/                       # pytest:單元 + 資料不變量 + 全管線整合(無網路無 GPU 可跑)
 scripts/run_all.sh           # 一條龍(GPU 機器)
 scripts/smoke_test.sh        # CPU smoke(無 GPU 也能跑)
@@ -200,9 +230,19 @@ python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 15 秒)
 - `test_generate.py` — 生成器確定性、時間序列不變量、**近10場/對決特徵不用未來資料**、盤口區隔度(AUC>0.6)
 - `test_build_dataset.py` — 時間切分無反序、jsonl schema、回應機率 == teacher 值、DPO pairs 方向扭曲
 - `test_dpo_ref.py` — DPO 的「disable adapter == base」reference 技巧的數值正確性
-- `test_pipeline.py` — 整合:generate→build→tiny→SFT(含 val)→DPO→**GRPO**→評估→推論→**merge 部署**
+- `test_grpo_reward.py` — GRPO reward 分數手算驗證(格式/Brier/方向/覆蓋)
+- `test_backtest.py` — ROI/CLV/drawdown/連敗 手算案例 + 門檻邊界
+- `test_qa.py` — 乾淨資料 0 error;重複 id/矛盾標籤/壞賠率要被抓出來
+- `test_pipeline.py` — 整合:generate→build→tiny→SFT(含 val)→DPO→**GRPO**→評估→推論(csv+json 兩路)→**merge 部署**
 
-## 11. 免責
+## 11. Roadmap(還沒做)
+
+- **足球 1X2**:三結果(主/和/客)版本——Poisson 生成器 + 三類機率輸出(要改 `common.py`
+  格式與評估,目前是二分類架構)
+- 多聯賽聯合訓練、傷兵/陣容特徵、大小分(Over/Under)輸出
+- GRPO 之上的 on-policy DPO 迭代、KL 調參
+
+## 12. 免責
 
 本專案僅供**學習與研究**。體育賠率由持牌機構提供,任何預測都不保證獲利;
 請遵守所在地法律,不要把它當成投注建議。

@@ -97,6 +97,8 @@ def main() -> None:
     ap.add_argument("--limit", type=int, default=None, help="只評估前 N 筆(smoke test)")
     ap.add_argument("--max-new-tokens", type=int, default=384)
     ap.add_argument("--no-model", action="store_true", help="只跑 baseline(LLM 沒訓練好時對照用)")
+    ap.add_argument("--pred-out", default=None,
+                    help="把逐筆 LLM 機率 + 開/收盤賠率匯出 CSV(給 eval/backtest.py 用)")
     args = ap.parse_args()
 
     rows = []
@@ -120,6 +122,27 @@ def main() -> None:
     test_ids = {r["match_id"] for r in rows}
     tm = df[df["match_id"].isin(test_ids)].reset_index(drop=True)
     ym = tm["home_win"].astype(int).values
+
+    # ---- 逐筆預測匯出(給 backtest 用)----
+    if args.pred_out and not args.no_model and llm_rows:
+        src = df.set_index("match_id")
+        recs = []
+        for lr in llm_rows:
+            m = src.loc[lr["match_id"]]
+            recs.append({
+                "match_id": lr["match_id"],
+                "date": m.get("date", ""),
+                "season": m.get("season", ""),
+                "p_home": lr["p_home"],
+                "open_ml_home": m.get("open_ml_home", ""),
+                "open_ml_away": m.get("open_ml_away", ""),
+                "close_ml_home": m.get("close_ml_home", ""),
+                "close_ml_away": m.get("close_ml_away", ""),
+                "outcome_home": int(m.get("home_win", "")),
+                "close_spread": m.get("close_spread", ""),
+            })
+        pd.DataFrame(recs).to_csv(args.pred_out, index=False)
+        print(f"preds  -> {args.pred_out} ({len(recs)} rows)")
 
     mkt_p = np.array([implied_prob(r.close_ml_home, r.close_ml_away)[0] for r in tm.itertuples()])
     mkt = _acc_brier_logloss(mkt_p, ym)
