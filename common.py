@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 import re
 from typing import Dict, List
@@ -30,7 +31,28 @@ PROMPT_TEMPLATE = """以下是待預測的賽事資料:
 (機率 = 該隊贏得比賽的機率;讓分覆蓋 = 該隊蓋過「收盤讓分盤」的機率。兩列各隊數字之和都必須等於 1)"""
 
 # 足球 1X2(主勝/和/客勝);v1 不輸出让分覆蓋(盤口資訊用 1X2 賠率欄)
-def _prompt_template(sport: str) -> str:
+def _prompt_template(sport: str, fmt: str = "prose") -> str:
+    if fmt == "typed":
+        # Jev 風格:固定選項集的 typed 決策(choice + probabilities + confidence),
+        # 程式直接可用,不用解析自由文字。
+        if sport == "soccer":
+            return (
+                "以下是待預測的足球賽事資料:\n\n"
+                "{features}\n\n"
+            "只輸出「一行 JSON 物件」,不得有其他文字:\n"
+            '{{"choice": "主隊/和局/客隊", "probabilities": [主勝, 和局, 客勝], "confidence": 數字}}\n\n'
+            "(probabilities 三個 0~1 小數之和=1;choice 是 probabilities 最大的那項;"
+            "confidence = 最大與第二大機率之差)"
+            )
+        return (
+            "以下是待預測的賽事資料:\n\n"
+            "{features}\n\n"
+            "只輸出「一行 JSON 物件」,不得有其他文字:\n"
+            '{{"choice": "主隊/客隊", "probabilities": [主隊, 客隊], '
+            '"cover_probabilities": [主隊蓋讓分盤, 客隊蓋讓分盤], "confidence": 數字}}\n\n'
+            "(各 probabilities 為 0~1 小數且同列之和=1;choice 取 probabilities 較大的那項;"
+            "confidence = 最大與第二大機率之差)"
+        )
     if sport == "soccer":
         return (
             "以下是待預測的足球賽事資料:\n\n"
@@ -82,6 +104,10 @@ def format_game_features(g: Dict, sport: str = "basketball") -> str:
             f"開盤 1X2 賠率(主/和/客): {_num(g.get('open_ml_home'), 2)} / {_num(g.get('open_ml_draw'), 2)} / {_num(g.get('open_ml_away'), 2)}",
             f"收盤 1X2 賠率(主/和/客): {_num(g.get('close_ml_home'), 2)} / {_num(g.get('close_ml_draw'), 2)} / {_num(g.get('close_ml_away'), 2)}",
         ]
+        if g.get("lr_home") is not None and not pd.isna(g.get("lr_home")):
+            lines.append(
+                f"本聯賽歷史結果分佈(截至開賽前): 主勝 {_pct(g.get('lr_home'))} / "
+                f"和局 {_pct(g.get('lr_draw'))} / 客勝 {_pct(g.get('lr_away'))}")
         return "\n".join(lines)
     lines = [
         f"賽季: {g.get('season', 'N/A')}",
@@ -95,7 +121,19 @@ def format_game_features(g: Dict, sport: str = "basketball") -> str:
         f"開盤賠率(主/客): {_num(g.get('open_ml_home'), 2)} / {_num(g.get('open_ml_away'), 2)}",
         f"收盤賠率(主/客): {_num(g.get('close_ml_home'), 2)} / {_num(g.get('close_ml_away'), 2)}",
     ]
+    if g.get("lr_home") is not None and not pd.isna(g.get("lr_home")):
+        lines.append(f"本聯賽歷史主勝率(截至開賽前): {_pct(g.get('lr_home'))}")
     return "\n".join(lines)
+
+
+def _pct(x, nd: int = 1) -> str:
+    try:
+        v = float(x)
+        if math.isnan(v):
+            return "無"
+        return f"{v * 100:.{nd}f}%"
+    except (TypeError, ValueError):
+        return "無"
 
 
 def normalize_game(g: Dict, sport: str = "basketball") -> Dict:
@@ -118,12 +156,13 @@ def normalize_game(g: Dict, sport: str = "basketball") -> Dict:
     return g
 
 
-def build_prompt(g: Dict, sport: str = "basketball") -> str:
-    return _prompt_template(sport).format(features=format_game_features(normalize_game(g, sport), sport))
+def build_prompt(g: Dict, sport: str = "basketball", fmt: str = "prose") -> str:
+    return _prompt_template(sport, fmt).format(
+        features=format_game_features(normalize_game(g, sport), sport))
 
 
-def build_messages(g: Dict, sport: str = "basketball") -> List[Dict]:
-    return [{"role": "user", "content": build_prompt(g, sport)}]
+def build_messages(g: Dict, sport: str = "basketball", fmt: str = "prose") -> List[Dict]:
+    return [{"role": "user", "content": build_prompt(g, sport, fmt)}]
 
 
 # ---------------------------------------------------------------- response
@@ -175,6 +214,138 @@ def outcome_from_margin(margin: float) -> int:
     """margin = home_score - away_score → 0=主勝 1=和 2=客勝。"""
     m = float(margin)
     return 0 if m > 0 else (1 if m == 0 else 2)
+
+
+# ------------------------------------------------------- typed(Jev 風格)輸出
+# 受 TypeSafe Jev「System One」啟發:答案 = 固定選項集的 choice + 機率 + confidence,
+# 程式可直接 branch,不需解析自由文字。0.9B LLM 的近似 = 輸出嚴格 JSON。
+
+TYPED_KEYS_SPORT = {
+    "basketball": ["主隊", "客隊"],
+    "soccer": ["主隊", "和局", "客隊"],
+}
+
+
+def confidence_from_probs(probs) -> float:
+    """confidence = max p − 第二高 p(分佈的「勝負手」差距;Jev 的 confidence 同理由
+    分佈形狀導出,但公式未公開,這裡用透明可驗證的版本)。"""
+    p = sorted([float(x) for x in probs], reverse=True)
+    if len(p) < 2:
+        return 0.0
+    return max(0.0, p[0] - p[1])
+
+
+def _rounded_sum_one(vals) -> list:
+    """round 到 4 位後把殘差補進最大項 → 和嚴格 = 1.0000。"""
+    probs = [round(float(v), 4) for v in vals]
+    resid = round(1.0 - sum(probs), 4)
+    if abs(resid) >= 1e-9:
+        k = int(np.argmax(probs))
+        probs[k] = round(probs[k] + resid, 4)
+    return probs
+
+
+def build_typed_response(p_home: float, cover_home: float = None,
+                         p_draw: float = None, sport: str = "basketball") -> str:
+    """產生 typed 目標回應(嚴格 JSON,SFT 的 assistant 文字)。
+
+    soccer:  {"choice": "主隊/和局/客隊", "probabilities": [主,和,客], "confidence": x}
+    basketball: 加 "cover_probabilities": [主,客]
+    """
+    if sport == "soccer":
+        ph = min(0.97, max(0.01, float(p_home)))
+        pd_ = min(0.94, max(0.01, float(p_draw) if p_draw is not None else 0.0))
+        pa = max(0.01, 1.0 - ph - pd_)
+        s = ph + pd_ + pa
+        probs = _rounded_sum_one([ph / s, pd_ / s, pa / s])
+        choice = ["主隊", "和局", "客隊"][int(np.argmax(probs))]
+        obj = {"choice": choice, "probabilities": probs,
+               "confidence": round(confidence_from_probs(probs), 4)}
+    else:
+        ph = min(0.98, max(0.02, float(p_home)))
+        probs = _rounded_sum_one([ph, 1.0 - ph])
+        choice = "主隊" if probs[0] >= 0.5 else "客隊"
+        obj = {"choice": choice, "probabilities": probs,
+               "confidence": round(confidence_from_probs(probs), 4)}
+        if cover_home is not None:
+            c = min(0.98, max(0.02, float(cover_home)))
+            obj["cover_probabilities"] = _rounded_sum_one([c, 1.0 - c])
+    return json.dumps(obj, ensure_ascii=False)
+
+
+def _iter_json_objects(text: str):
+    """找出文字中所有「平衡的大括號候選子串」(不處理巢狀字串內的括號,够用)。"""
+    for m in re.finditer(r"\{", text):
+        depth, i = 0, m.start()
+        while i < len(text):
+            if text[i] == "{":
+                depth += 1
+            elif text[i] == "}":
+                depth -= 1
+                if depth == 0:
+                    yield text[m.start():i + 1]
+                    break
+            i += 1
+
+
+def parse_typed_response(text: str, sport: str = "basketball") -> Dict:
+    """解析 typed(JSON)輸出;找不到合法結構就 format_ok=False。"""
+    out = {
+        "pred": None, "p_home": None, "p_away": None, "p_draw": None,
+        "cover_home": None, "cover_away": None, "confidence": None,
+        "format_ok": False, "typed": True,
+    }
+    if not text:
+        return out
+    for cand in _iter_json_objects(text):
+        try:
+            obj = json.loads(cand)
+        except (json.JSONDecodeError, ValueError):
+            continue
+        if not isinstance(obj, dict) or "probabilities" not in obj:
+            continue
+        try:
+            probs = [float(x) for x in obj["probabilities"]]
+        except (TypeError, ValueError):
+            continue
+        if len(probs) != len(TYPED_KEYS_SPORT[sport]) or min(probs) < 0:
+            continue
+        s = sum(probs)
+        if s <= 0:
+            continue
+        probs = [x / s for x in probs]
+        out["pred"] = obj.get("choice") if obj.get("choice") in TYPED_KEYS_SPORT[sport] else None
+        if sport == "soccer":
+            out["p_home"], out["p_draw"], out["p_away"] = probs
+        else:
+            out["p_home"], out["p_away"] = probs
+        if isinstance(obj.get("cover_probabilities"), (list, tuple)) and len(obj["cover_probabilities"]) == 2:
+            try:
+                c = [float(x) for x in obj["cover_probabilities"]]
+                cs = sum(c)
+                if cs > 0:
+                    out["cover_home"], out["cover_away"] = c[0] / cs, c[1] / cs
+            except (TypeError, ValueError):
+                pass
+        if isinstance(obj.get("confidence"), (int, float)):
+            out["confidence"] = float(obj["confidence"])
+        else:
+            out["confidence"] = confidence_from_probs(probs)
+        out["format_ok"] = True
+        return out
+    return out
+
+
+def parse_response_any(text: str, sport: str = "basketball") -> Dict:
+    """prose 優先;不成再試 typed(兩種格式都接受 → GRPO/評估更穩)。"""
+    out = parse_response(text, sport)
+    if out.get("format_ok"):
+        return out
+    t = parse_typed_response(text, sport)
+    if t.get("format_ok"):
+        return t
+    out["confidence"] = t.get("confidence")
+    return out
 
 
 def parse_response(text: str, sport: str = "basketball") -> Dict:
@@ -229,7 +400,83 @@ FEATURE_COLS = [
     "open_spread", "close_spread",
     "open_ml_home", "open_ml_away", "close_ml_home", "close_ml_away",
     "open_ml_draw", "close_ml_draw",
+    # 聯賽 base-rate 錨定(Jev 的足球預測應用發現:不給 league 先驗,
+    # 模型會把和局/特定結果系統性低估)→ 時間序列累計、只看過去,無洩漏
+    "lr_home", "lr_draw", "lr_away",
 ]
+
+
+def attach_league_rates(df: pd.DataFrame, sport: str = "basketball",
+                        pseudo: int = 20) -> pd.DataFrame:
+    """加上「截至開賽前的聯賽結果分佈」欄位(先驗平滑的累計率)。
+
+    - 只用「嚴格早於該日」的比賽(同日不互看,無特徵洩漏)。
+    - 前 pseudo 個擬似比賽作先驗:soccer [0.45, 0.25, 0.30]、basketball 主勝 0.55,
+      讓賽季前幾場也有合理的 base rate。
+    回傳 df 加上 lr_home(兩項運動都有)、lr_draw/lr_away(soccer)。
+    """
+    d = df.copy()
+    if "date" not in d.columns or "margin" not in d.columns:
+        return d
+    d = d.sort_values("date", kind="stable").reset_index(drop=True)
+    n = len(d)
+    if n == 0:
+        return d
+    dates = d["date"].astype(str).values
+    if sport == "soccer":
+        y = np.array([outcome_from_margin(m) for m in d["margin"].values])
+        prior = np.array([0.45 * pseudo, 0.25 * pseudo, 0.30 * pseudo])
+    else:
+        y = np.array([1 if outcome_from_margin(m) == 0 else 0 for m in d["margin"].values])
+        prior = np.array([0.55 * pseudo, 0.45 * pseudo])
+    cum = prior.copy()
+    lr = np.zeros((n, len(prior)))
+    i = 0
+    for t in range(n):
+        # 把「今天之前」的比賽全部累計進 cum
+        while i < t and dates[i] < dates[t]:
+            cum[y[i]] += 1
+            i += 1
+        # 同一天的比賽不互看:lr[t] 只用 dates < dates[t]
+        lr[t] = cum / cum.sum()
+    d["lr_home"] = lr[:, 0]
+    if sport == "soccer":
+        d["lr_draw"] = lr[:, 1]
+        d["lr_away"] = lr[:, 2]
+    return d
+
+
+def confidence_gated_stats(probs, outcomes, sport: str = "basketball", n_bins: int = 4) -> List[Dict]:
+    """Jev 的 RLCD 賣點 = confidence 越高 → 準確率越高(聚合意義上)。
+
+    這裡用相同的切法驗證我們自己的模型:依 confidence(=max p − 第二高 p)分箱,
+    回傳每箱的 {conf_lo, conf_hi, n, acc}。若準確率隨 confidence 單調上升,
+    confidence 就「可以拿去 gate 下注/送人工」。
+    """
+    probs = [list(p) for p in probs]
+    if not probs:
+        return []
+    confs = np.array([confidence_from_probs(p) for p in probs])
+    if sport == "soccer":
+        correct = np.array([
+            1.0 if int(np.argmax(p)) == int(o) else 0.0 for p, o in zip(probs, outcomes)
+        ])
+    else:
+        correct = np.array([
+            1.0 if (int(np.argmax(p)) == 0) == (int(o) == 1) else 0.0 for p, o in zip(probs, outcomes)
+        ])
+    edges = np.linspace(0.0, 1.0, n_bins + 1)
+    idx = np.clip(np.digitize(confs, edges[1:-1]), 0, n_bins - 1)
+    out = []
+    for b in range(n_bins):
+        m = idx == b
+        if m.sum() == 0:
+            continue
+        out.append({
+            "conf_lo": round(float(edges[b]), 3), "conf_hi": round(float(edges[b + 1]), 3),
+            "n": int(m.sum()), "acc": round(float(correct[m].mean()), 4),
+        })
+    return out
 
 
 def feature_matrix(df: pd.DataFrame):

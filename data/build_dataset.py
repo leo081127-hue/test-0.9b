@@ -29,8 +29,19 @@ import pandas as pd
 from sklearn.ensemble import HistGradientBoostingClassifier
 from sklearn.metrics import roc_auc_score
 
-from common import (OUTCOME_LABELS, build_prompt, build_response, feature_matrix,
-                    implied_prob, implied_prob_3way, outcome_from_margin)
+from common import (OUTCOME_LABELS, attach_league_rates, build_prompt, build_response,
+                    build_typed_response, feature_matrix, implied_prob, implied_prob_3way,
+                    outcome_from_margin)
+
+
+def make_response(fmt: str, sport: str, p_home: float, cover_home: float,
+                  reasons: list, p_draw: float = None) -> str:
+    """prose(預設)= 推理 + 固定格式行;typed(Jev 風格)= 嚴格 JSON。"""
+    if fmt == "typed":
+        if sport == "soccer":
+            return build_typed_response(p_home, p_draw=p_draw, sport="soccer")
+        return build_typed_response(p_home, cover_home, sport="basketball")
+    return build_response(p_home, cover_home, reasons, sport=sport, p_draw=p_draw)
 
 
 def make_reasons_soccer(r: pd.Series, p3: tuple, mkt3: tuple) -> list[str]:
@@ -141,9 +152,10 @@ def main_soccer(df, train, val, test, i_tr, i_va, args) -> None:
                 "match_id": r["match_id"],
                 "date": r["date"],
                 "sport": "soccer",
-                "prompt": [{"role": "user", "content": build_prompt(game, "soccer")}],
-                "response": build_response(p3[0], None, make_reasons_soccer(r, p3, mkt3),
-                                           sport="soccer", p_draw=p3[1]),
+                "format": args.format,
+                "prompt": [{"role": "user", "content": build_prompt(game, "soccer", args.format)}],
+                "response": make_response(args.format, "soccer", p3[0], None,
+                                          make_reasons_soccer(r, p3, mkt3), p_draw=p3[1]),
                 "outcome": int(y),
                 "outcome_home": int(r["home_win"]),
                 "outcome_draw": int(r["margin"] == 0),
@@ -169,12 +181,16 @@ def main_soccer(df, train, val, test, i_tr, i_va, args) -> None:
         if game is None:
             continue
         mkt3 = implied_prob_3way(game["close_ml_home"], game["close_ml_draw"], game["close_ml_away"])
+        _rej = (make_response(args.format, "soccer", rp[0], None,
+                              make_reasons_soccer(pd.Series(game), rp, mkt3), p_draw=rp[1])
+                if args.format == "typed" else
+                build_response(rp[0], None, make_reasons_soccer(pd.Series(game), rp, mkt3),
+                               sport="soccer", p_draw=rp[1]))
         pairs.append({
             "match_id": row["match_id"],
             "prompt": row["prompt"][0]["content"],
             "chosen": row["response"],
-            "rejected": build_response(rp[0], None, make_reasons_soccer(pd.Series(game), rp, mkt3),
-                                       sport="soccer", p_draw=rp[1]),
+            "rejected": _rej,
             "outcome": row["outcome"],
         })
     rng = np.random.default_rng(args.seed)
@@ -198,6 +214,8 @@ def main() -> None:
     ap.add_argument("--matches", default="data/demo/matches.csv")
     ap.add_argument("--out", default="data/out")
     ap.add_argument("--sport", choices=("basketball", "soccer"), default="basketball")
+    ap.add_argument("--format", choices=("prose", "typed"), default="prose",
+                    help="prose=推理+固定格式行(預設);typed=Jev 風格嚴格 JSON")
     ap.add_argument("--train-frac", type=float, default=0.70)
     ap.add_argument("--val-frac", type=float, default=0.15)
     ap.add_argument("--max-pairs", type=int, default=4000, help="DPO pairs 上限(0=全部 train)")
@@ -206,6 +224,7 @@ def main() -> None:
 
     df = pd.read_csv(args.matches)
     df = df.sort_values(["date", "match_id"]).reset_index(drop=True)
+    df = attach_league_rates(df, args.sport)  # lr_home(/lr_draw/lr_away):只看過去的 base rate
     n = len(df)
     i_tr = int(n * args.train_frac)
     i_va = int(n * (args.train_frac + args.val_frac))
@@ -258,8 +277,11 @@ def main() -> None:
             rows.append({
                 "match_id": r["match_id"],
                 "date": r["date"],
-                "prompt": [{"role": "user", "content": build_prompt(game)}],
-                "response": build_response(ph, ch, make_reasons(r, ph, mkt_h)),
+                "sport": "basketball",
+                "format": args.format,
+                "prompt": [{"role": "user", "content": build_prompt(game, "basketball", args.format)}],
+                "response": make_response(args.format, "basketball", ph, ch,
+                                          make_reasons(r, ph, mkt_h)),
                 "outcome_home": int(r["home_win"]),
                 "cover_home": int(r["margin"] > r["close_spread"]),
                 "teacher_p_home": round(ph, 4),
@@ -285,12 +307,15 @@ def main() -> None:
         if game is None:
             continue
         mkt_h, _ = implied_prob(game["close_ml_home"], game["close_ml_away"])
+        _rej = (make_response(args.format, "basketball", rp, 1.0 - row["teacher_cover_home"], [])
+                if args.format == "typed" else
+                build_response(rp, 1.0 - row["teacher_cover_home"],
+                               make_reasons(pd.Series(game), p, mkt_h)))
         pairs.append({
             "match_id": row["match_id"],
             "prompt": row["prompt"][0]["content"],
             "chosen": row["response"],
-            "rejected": build_response(rp, 1.0 - row["teacher_cover_home"],
-                                       make_reasons(pd.Series(game), p, mkt_h)),
+            "rejected": _rej,
             "outcome_home": row["outcome_home"],
         })
     if args.max_pairs and len(pairs) > args.max_pairs:

@@ -24,8 +24,10 @@
 | `home_rest` / `away_rest` | int | ⭕ | 休息天數 |
 | `home_record` / `away_record` | str `W-L` | ⭕ | 本季主場/客場紀錄(字串,如 `12-8`) |
 | `h2h_home_w` / `h2h_away_w` | int | ⭕ | 近 5 次對決各隊勝場 |
+| `lr_home`(/`lr_draw`/`lr_away`) | float | 🤖 自動 | **不需手動提供**:`common.attach_league_rates()` 依時間序列累計「該場開賽前」的聯賽結果分佈(先驗平滑)。只回看過去,無洩漏。是 Jev 足球預測的「league 先驗」技巧,防止模型系統性低估和局 |
 
-- ⭕ = 選填;缺漏會以 `0` 當特徵、prompt 中顯示「無」。
+- ⭕ = 選填;缺漏會以 `0` 當特徵、prompt 中顯示「無」。🤖 = pipeline 自動計算。
+- **輸出格式**:`data/build_dataset.py --format {prose,typed}`。`prose`(預設)= 推理 + 固定格式行;`typed`(Jev 風格)= 嚴格 JSON `{"choice":…, "probabilities":[…], "confidence":…}`,程式可直接 `json.loads`。`common.parse_response_any()` 兩種都吃,GRPO reward / 評估 / 推論皆然。
 - 自訂特徵表:只要你的欄位是數值型,加進 `common.py` 的 `FEATURE_COLS` 就能進 teacher 模型與 baseline;想進 prompt 文字,改 `common.format_game_features()`。
 - 沒有盤口資料的賽事:讓分欄填 `0`、ML 填 `1.85/1.90`(≈五五波)即可,pipeline 仍會跑。
 

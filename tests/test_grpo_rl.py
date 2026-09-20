@@ -176,13 +176,15 @@ def test_run_audit_stub_matches_hand_computed(grpo_env):
     rows = [{"prompt": [{"role": "user", "content": build_prompt(_game(i))}],
              "outcome_home": 1, "cover_home": 1} for i in range(4)]
     s = run_audit(_StubModel(ftok, GOOD_HOME), ftok, rows, n=4, max_new=96)
-    # GOOD_HOME @ y=1, c=1:format 1 + brier 0.96 + direction 0.5 + cover 0.273
+    # 分項為「未乘權重」raw 值:format 1 + brier 0.96 + direction 1.0 + cover 0.91
+    # reward_mean 用預設權重 1/1/0.5/0.3
     assert s["n"] == 4
     assert s["format_rate"] == pytest.approx(1.0)
     assert s["brier_mean"] == pytest.approx(0.96, abs=1e-9)
-    assert s["direction_mean"] == pytest.approx(0.5, abs=1e-9)
-    assert s["cover_mean"] == pytest.approx(0.3 * (1 - 0.09), abs=1e-9)
+    assert s["direction_mean"] == pytest.approx(1.0, abs=1e-9)
+    assert s["cover_mean"] == pytest.approx(1 - 0.09, abs=1e-9)
     assert s["reward_mean"] == pytest.approx(1.0 + 0.96 + 0.5 + 0.3 * 0.91, abs=1e-9)
+    assert s["weights"] == {"format": 1.0, "brier": 1.0, "direction": 0.5, "cover": 0.3}
 
 
 def test_run_audit_garbage_zero(grpo_env):

@@ -223,14 +223,16 @@ common.py                    # prompt 格式 / 回應解析 / 特徵矩陣 / 指
 data/
   SCHEMA.md                  # matches.csv 欄位規格
   examples/matches_sample.csv
-  generate_demo_data.py      # 合成 demo 資料
+  generate_demo_data.py      # 合成 demo 資料(籃球)
+  generate_demo_soccer.py    # 合成 demo 資料(足球,Dixon-Coles 1X2)
   build_dataset.py           # 時間切分 + teacher 蒸餾 → train/val/test.jsonl + dpo_pairs.jsonl
 train/
   sft.py                     # LoRA SFT(主)
   dpo.py                     # DPO(選用)
-  grpo.py                    # GRPO RL(選用,需 trl)
+  grpo.py                    # GRPO RL(選用,需 trl;reward 權重 --w-* 可調)
 eval/evaluate.py             # 評估 + baseline 對照 + 分季統計 + report.json + calibration.png + pred-out
 eval/backtest.py             # 回測:ROI / CLV / drawdown / 門檻掃描(對照 market_open)
+eval/jev_baseline.py         # Jev(TypeSafe)API baseline(選用,要 TYPESAFE_API_KEY)
 data/qa_report.py            # 真實資料訓練前品質檢查(重複 id/矛盾標籤/vig/…)
 infer/predict.py             # 單筆預測 CLI
 tools/smoke_tiny_model.py    # 本地 tiny 模型(無網路 smoke test 用)
@@ -250,19 +252,27 @@ python -m pytest tests/ -q          # 全部(含整合管線,2 核 CPU 約 5~6 �
 python -m pytest tests/ -q -k "not pipeline"   # 只快測(約 30 秒)
 ```
 
-覆蓋(11 個檔、80 項):
+覆蓋(17 個檔、139 項):
 - `test_common.py` — prompt/回應格式、解析(含全形符號、未加和為 1 的正規化)、Brier/LogLoss/ECE、特徵矩陣
 - `test_generate.py` — 生成器確定性、時間序列不變量、**近10場/對決特徵不用未來資料**、盤口區隔度(AUC>0.6)
 - `test_build_dataset.py` — 時間切分無反序、jsonl schema、回應機率 == teacher 值、DPO pairs 方向扭曲
 - `test_dpo_ref.py` — DPO 的「disable adapter == base」reference 技巧的數值正確性
 - `test_dpo_learning.py` — **DPO 行為測試**:偏好學習真的發生(loss 下降、chosen 隱含優勢變大、policy 更偏好 chosen)
-- `test_grpo_reward.py` — GRPO reward 手算驗證(格式/Brier/方向/覆蓋)+ 11 個解析健壯性邊緣案例
-  (正規化、全形符號、極端機率、0/0 拒判、batch、bytes、分項加總一致性)
+- `test_grpo_reward.py` — GRPO reward 手算驗證(格式/Brier/方向/覆蓋)+ 解析健壯性邊緣案例 +
+  **typed 與 prose 同分** + 自訂權重
 - `test_grpo_rl.py` — **GRPO 行為測試**:reward 光譜單調性(有訊號)、trainer log 指標有限無 NaN、
   reward 饑餓(群組方差=0)時數值穩定、rows 自動 pad、`run_audit` 與手算分項一致
 - `test_backtest.py` — ROI/CLV/drawdown/連敗 手算案例 + 門檻邊界
 - `test_qa.py` — 乾淨資料 0 error;重複 id/矛盾標籤/壞賠率要被抓出來
 - `test_pipeline.py` — 整合:generate→build→tiny→SFT(含 val)→DPO→**GRPO**→評估→推論(csv+json 兩路)→**merge 部署**
+- `test_soccer_common.py` / `test_soccer_generate.py` — 1X2 解析/多類指標手算、DC 生成器
+  (和局率、VIG、**特徵不用未來資料**)
+- `test_soccer_backtest.py` / `test_soccer_pipeline.py` — 1X2 回測手算、soccer 整合管線 e2e
+- `test_typed_common.py` — **typed(Jev 風格)JSON roundtrip**、confidence 分箱手算、
+  **聯賽 base-rate 無洩漏**(同日不互看)、prompt 注入
+- `test_typed_build.py` — `--format typed` 全管線:回應都是可 `json.loads` 的嚴格 JSON、
+  choice==argmax、DPO pairs 反方向、GRPO reward 能吃 typed
+- `test_jev_client.py` — Jev API 請求形狀/錯誤路徑/回應解析(mock,無網路)、**state 不含答案欄位**
 
 > RL 測試的誠實邊界:CPU 上隨機初始化的 tiny 模型學不會輸出格式(reward 全 0、群組方差 0),
 > 所以套件不斷言「GRPO 一定提升 reward」——那需要 GPU + 已 SFT 的模型,流程見 §6
@@ -296,27 +306,58 @@ python data/generate_demo_soccer.py --seasons 5 --games-per-season 200 --out dat
 | model | acc | Brier | LogLoss | ECE |
 |---|---|---|---|---|
 | Market close(1X2 去抽水) | 0.527 | **0.5643** | **0.9543** | 0.067 |
-| teacher(我們模型的代理,三類 HGB) | **0.547** | 0.6077 | 1.0187 | — |
-| LogReg(多項) | 0.527 | 0.5847 | 0.9906 | 0.053 |
+| teacher(我們模型的代理,三類 HGB) | 0.527 | 0.6032 | 1.0115 | — |
+| LogReg(多項) | 0.527 | 0.5846 | 0.9903 | 0.053 |
 | Coin(均分 1/3) | 0.480 | 0.6667 | 1.0986(=ln 3) | 0.147 |
 
 1X2 回測(flat 1u @ 開盤賠率,門檻 = max 機率):
 
 | 策略 | n | 命中率 | ROI | CLV | maxDD |
 |---|---|---|---|---|---|
-| teacher @ 0.55 | 79 | 60.8% | +2.9% | **+0.131** | 7.4u |
+| teacher @ 0.60(門檻掃描最佳) | 73 | 61.6% | +3.75% | **+0.142** | 6.5u |
 | market_open 基準(收盤 favorite) | 55 | 72.7% | +8.9% | ≈ +0.004(sanity) | 2.6u |
 
-> teacher 的 argmax 方向略優於市場,但機率校準仍不及市場收盤(多類 Brier 0.61 vs 0.56)——
+> teacher 的 argmax 方向追平市場,但機率校準仍不及市場收盤(多類 Brier 0.60 vs 0.56)——
 > 這正是 RL(GRPO/DPO)該去推的部分:讓 0.9B 的機率「更貼近真實分佈」。
 
-## 12. Roadmap(還沒做)
+## 12. 從 Jev(TypeSafe AI)學到的三件事
+
+[Jev](https://typesafe.ai/)(2026-09-15 發布,「System One」模型:送 state + typed 問題,
+回**typed 決策 + 校準機率**,不產生文字;RLCD = Reinforcement Learning for Calibrated
+Decisions 訓練)和本專案目標相同——把「預測」變成程式可以直接 branch 的機率。
+本倉庫採納了它的三個設計:
+
+1. **typed 輸出格式**(`--format typed`):回應 = 嚴格 JSON
+   `{"choice": "主隊/和局/客隊", "probabilities": [...], "confidence": 0.20}`,
+   解析成功率接近 Jev 的「結構化輸出 0% 錯誤」(openjev 專案也證實小開源模型可以用
+   同樣介面)。prose 與 typed 可混著解析(`parse_response_any`),GRPO reward 兩吃。
+2. **confidence gating**(RLCD 的賣點:confidence 越高 → 準確率越高):
+   評估 report 的 `LLM.confidence_gated` 會分箱驗證我們自己模型的 confidence 是否
+   真的「可信」;predict 會印出 confidence 供下注門檻使用。
+3. **聯賽 base-rate 錨定**:Jev 的[足球預測應用](https://github.com/JohnJKerr/football-predictor)
+   發現不送 league 先驗時,模型會把和局系統性低估(19% vs 聯賽 24.5%)。本倉庫在
+   prompt 與特徵(`lr_home`/`lr_draw`/`lr_away`,時間序列累計、只看過去)加入該場
+   開賽前的聯賽結果分佈,teacher logloss 1.019 → 1.011。
+
+**把 Jev 當成 baseline 來對照(選用)**:
+
+```bash
+export TYPESAFE_API_KEY=sk-...        # console.typesafe.ai(early access)或 Vercel AI Gateway
+python eval/jev_baseline.py --test-jsonl data/out/test.jsonl \
+    --matches-csv data/demo/soccer.csv --sport soccer --report output/jev.json
+```
+
+誠實註解:Jev 的官方 benchmark 是 vendor 自跑;「零幻覺」指輸出必然符合 schema,
+**不代表答案對**——所以本倉庫把它當 baseline 用,而不是神。
+
+## 13. Roadmap(還沒做)
 
 - 足球讓分(Asian handicap)+ 大小分(Over/Under)輸出
 - 多聯賽聯合訓練、傷兵/陣容特徵
 - GRPO 之上的 on-policy DPO 迭代、KL 調參
+- typed 格式 + confidence gate 的完整 RL 循環(現在是解析/評估支援,RL 權重已可調)
 
-## 13. 免責
+## 14. 免責
 
 本專案僅供**學習與研究**。體育賠率由持牌機構提供,任何預測都不保證獲利;
 請遵守所在地法律,不要把它當成投注建議。

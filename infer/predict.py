@@ -21,7 +21,7 @@ if _ROOT not in sys.path:
 
 import pandas as pd
 
-from common import build_messages, parse_response
+from common import attach_league_rates, build_messages, parse_response_any
 from train.sft import DTYPES, load_causal_lm
 
 
@@ -35,6 +35,8 @@ def main() -> None:
     ap.add_argument("--csv", default=None)
     ap.add_argument("--row", type=int, default=None)
     ap.add_argument("--sport", choices=("basketball", "soccer", "auto"), default="auto")
+    ap.add_argument("--format", choices=("prose", "typed"), default="prose",
+                    help="prose=推理+固定格式行;typed=Jev 風格嚴格 JSON(需與訓練格式一致)")
     ap.add_argument("--max-new-tokens", type=int, default=384)
     ap.add_argument("--temperature", type=float, default=0.0)
     args = ap.parse_args()
@@ -44,6 +46,8 @@ def main() -> None:
             game = json.load(f)
     elif args.csv is not None and args.row is not None:
         df = pd.read_csv(args.csv)
+        # 附上「截至該行開賽前」的聯賽 base rate(與訓練時相同)
+        df = attach_league_rates(df, "soccer" if "open_ml_draw" in df.columns else "basketball")
         game = df.iloc[args.row].to_dict()
     else:
         ap.error("需要 --features-json 或 (--csv + --row)")
@@ -71,7 +75,7 @@ def main() -> None:
         model = model.cuda()
     model.eval()
 
-    text = tok.apply_chat_template(build_messages(game, sport),
+    text = tok.apply_chat_template(build_messages(game, sport, args.format),
                                    tokenize=False, add_generation_prompt=True)
     ids = tok(text, return_tensors="pt").to(model.device)
     gen_kwargs = dict(
@@ -84,7 +88,7 @@ def main() -> None:
     with torch.no_grad():
         gen = model.generate(**ids, **gen_kwargs)
     out = tok.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-    p = parse_response(out, sport)
+    p = parse_response_any(out, sport)
 
     print("=" * 60)
     print("模型輸出:")
@@ -98,6 +102,8 @@ def main() -> None:
     print(f"  客隊勝率   : {p['p_away']:.3f}" if p["p_away"] is not None else "  客隊勝率   : n/a")
     if sport != "soccer":
         print(f"  讓分覆蓋主 : {p['cover_home']:.3f}" if p["cover_home"] is not None else "  讓分覆蓋主 : n/a")
+    if p.get("confidence") is not None:
+        print(f"  confidence : {p['confidence']:.3f}(Jev 風格:分佈的勝負手差距;gate 下停用)")
     if not p["format_ok"]:
         print("  ⚠️ 格式解析失敗:模型輸出沒有符合訓練格式,請檢查 adapter 或 max-new-tokens。")
 

@@ -25,9 +25,9 @@ if _ROOT not in sys.path:
 import numpy as np
 import pandas as pd
 
-from common import (_acc_brier_logloss, _acc_brier_logloss_mc, ece, ece_mc,
-                    feature_matrix, implied_prob, implied_prob_3way,
-                    outcome_from_margin, parse_response)
+from common import (_acc_brier_logloss, _acc_brier_logloss_mc, attach_league_rates,
+                    confidence_gated_stats, ece, ece_mc, feature_matrix, implied_prob,
+                    implied_prob_3way, outcome_from_margin, parse_response_any)
 from train.sft import DTYPES, load_causal_lm
 
 
@@ -58,7 +58,7 @@ def run_model_eval_soccer(args, rows: list[dict]):
                 do_sample=False, pad_token_id=tok.pad_token_id,
             )
         out = tok.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        p = parse_response(out, "soccer")
+        p = parse_response_any(out, "soccer")
         if p["p_home"] is None:
             n_err += 1
             print(f"[{k + 1}/{len(rows)}] {row['match_id']}  parse FAIL (raw: {out[:80]!r})")
@@ -76,6 +76,9 @@ def run_model_eval_soccer(args, rows: list[dict]):
     m = _acc_brier_logloss_mc(Pm, Ym)
     m["ece"] = ece_mc(Pm, Ym)
     m["parse_error_rate"] = n_err / max(1, len(rows))
+    # Jev/RLCD:confidence 越高是否真的越準(分箱驗證;全解析失敗時留空)
+    m["confidence_gated"] = (confidence_gated_stats(Pm, Ym.argmax(1), "soccer")
+                             if len(P) > 0 else [])
     return m, Pm, Ym, llm_rows
 
 
@@ -106,7 +109,7 @@ def run_model_eval(args, rows: list[dict]):
                 do_sample=False, pad_token_id=tok.pad_token_id,
             )
         out = tok.decode(gen[0][ids["input_ids"].shape[1]:], skip_special_tokens=True)
-        p = parse_response(out)
+        p = parse_response_any(out)
         if p["p_home"] is None:
             n_err += 1
             print(f"[{k + 1}/{len(rows)}] {row['match_id']}  parse FAIL (raw: {out[:80]!r})")
@@ -131,13 +134,17 @@ def run_model_eval(args, rows: list[dict]):
             (((np.asarray(llm_cov_p) >= 0.5).astype(float)) ==
              (np.asarray(llm_cov_y) == 1)).mean()
         )
+    # Jev/RLCD:confidence 越高是否真的越準(分箱驗證)
+    m["confidence_gated"] = confidence_gated_stats(
+        [[p_, 1.0 - p_] for p_ in llm_p],
+        [1 if y == 1 else 0 for y in llm_y], "basketball")
     return m, llm_p, llm_y, llm_rows
 
 
 def main_soccer_baselines(args, rows: list[dict], report: dict,
                          llm_p, llm_y, llm_rows) -> None:
     """足球 1X2 的 baseline / pred-out / 分季 / 輸出 / 校準圖。"""
-    df = pd.read_csv(args.matches_csv)
+    df = attach_league_rates(pd.read_csv(args.matches_csv), "soccer")
     test_ids = {r["match_id"] for r in rows}
     tm = df[df["match_id"].isin(test_ids)].reset_index(drop=True)
     ym3 = np.array([outcome_from_margin(m) for m in tm["margin"].values])
@@ -215,6 +222,7 @@ def main_soccer_baselines(args, rows: list[dict], report: dict,
                 by_season[s] = entry
         report["by_season"] = by_season
 
+    _maybe_add_jev(report, rows, args)
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)
@@ -275,6 +283,23 @@ def main_soccer_baselines(args, rows: list[dict], report: dict,
         print(f"plot   -> {args.plot}")
 
 
+def _maybe_add_jev(report: dict, rows: list, args) -> None:
+    """--jev:把 Jev(TypeSafe API)當成一個 baseline 放進 report(要 API key)。"""
+    if not getattr(args, "jev", False):
+        return
+    if not os.environ.get("TYPESAFE_API_KEY"):
+        print("[jev] 未設定 TYPESAFE_API_KEY → 跳過 Jev baseline")
+        return
+    from eval.jev_baseline import run_jev_baseline
+    try:
+        m = run_jev_baseline(rows, args.matches_csv, args.sport)
+        report["Jev"] = m
+        print(f"[jev] n={m['n']} acc={m.get('acc')} brier={m.get('brier')} "
+              f"logloss={m.get('logloss')} (api_err={m['api_error_rate']:.2f})")
+    except Exception as e:
+        print(f"[jev] 失敗,跳過 baseline:{e}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--model-id", default="IFM/K2-Horizon-0.9B")
@@ -286,12 +311,15 @@ def main() -> None:
     ap.add_argument("--matches-csv", required=True, help="完整資料(baseline 要用 train 段擬合)")
     ap.add_argument("--report", default="output/report.json")
     ap.add_argument("--plot", default=None, help="校準曲線 png 路徑")
+    ap.add_argument("--jev", action="store_true",
+                    help="把 Jev(TypeSafe API)當成一個 baseline(需 TYPESAFE_API_KEY)")
     ap.add_argument("--limit", type=int, default=None, help="只評估前 N 筆(smoke test)")
     ap.add_argument("--max-new-tokens", type=int, default=384)
     ap.add_argument("--no-model", action="store_true", help="只跑 baseline(LLM 沒訓練好時對照用)")
     ap.add_argument("--pred-out", default=None,
                     help="把逐筆 LLM 機率 + 開/收盤賠率匯出 CSV(給 eval/backtest.py 用)")
     args = ap.parse_args()
+    # --jev 預設 False;若使用者想跑 Jev baseline,import 在此(避免沒 key 也拉動該模組)
 
     rows = []
     with open(args.test_jsonl, encoding="utf-8") as f:
@@ -317,7 +345,7 @@ def main() -> None:
         return main_soccer_baselines(args, rows, report, llm_p, llm_y, llm_rows)
 
     # ---- baselines ----
-    df = pd.read_csv(args.matches_csv)
+    df = attach_league_rates(pd.read_csv(args.matches_csv), "basketball")
     test_ids = {r["match_id"] for r in rows}
     tm = df[df["match_id"].isin(test_ids)].reset_index(drop=True)
     ym = tm["home_win"].astype(int).values
@@ -386,6 +414,7 @@ def main() -> None:
         report["by_season"] = by_season
 
     # ---- 輸出 ----
+    _maybe_add_jev(report, rows, args)
     os.makedirs(os.path.dirname(args.report) or ".", exist_ok=True)
     with open(args.report, "w", encoding="utf-8") as f:
         json.dump(report, f, ensure_ascii=False, indent=2)

@@ -181,3 +181,38 @@ def test_reward_soccer_garbage_and_missing_labels():
     r = make_reward()
     assert r(prompts=["p"], completions=["亂碼"], sport=["soccer"], outcome=[0])[0] == 0.0
     assert r(prompts=["p"], completions=[GOOD_S]) is None  # 無 outcome → None
+
+
+# ------------------------------------------------------------- typed 與權重
+
+def test_reward_typed_equals_prose():
+    from common import build_typed_response
+    r = make_reward()
+    # soccer:prose 與 typed 同機率 → 同分
+    s_prose = r(prompts=["p"], completions=[GOOD_S], sport=["soccer"], outcome=[0])
+    s_typed = r(prompts=["p"], completions=[build_typed_response(0.45, p_draw=0.25,
+                                                                 sport="soccer")],
+                 sport=["soccer"], outcome=[0])
+    assert s_typed[0] == pytest.approx(s_prose[0], abs=1e-6)
+    # basketball:typed 含 cover
+    b_prose = ("最終預測: 主隊\n機率: 主隊 0.60, 客隊 0.40\n"
+               "讓分覆蓋: 主隊 0.55, 客隊 0.45")
+    s1 = r(prompts=["p"], completions=[b_prose], outcome_home=[1], cover_home=[1])
+    s2 = r(prompts=["p"], completions=[build_typed_response(0.60, 0.55,
+                                                            sport="basketball")],
+           outcome_home=[1], cover_home=[1])
+    assert s2[0] == pytest.approx(s1[0], abs=1e-6)
+
+
+def test_reward_custom_weights():
+    from common import build_typed_response
+    t = build_typed_response(0.45, p_draw=0.25, sport="soccer")
+    base = make_reward()(prompts=["p"], completions=[t], sport=["soccer"], outcome=[0])[0]
+    # brier 權重 2 → 比預設多一個 brier(=1-(0.55²... 用實際分項算)
+    from train.grpo import reward_components_soccer_raw
+    c = reward_components_soccer_raw(t, 0.0)
+    doubled = make_reward({"brier": 2.0})(prompts=["p"], completions=[t],
+                                          sport=["soccer"], outcome=[0])[0]
+    expect = 1.0 * c["format"] + 2.0 * c["brier"] + 0.5 * c["direction"]
+    assert doubled == pytest.approx(expect, abs=1e-9)
+    assert doubled > base if c["brier"] > 0 else True

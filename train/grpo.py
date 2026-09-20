@@ -54,42 +54,51 @@ try:
 except ImportError:
     sys.exit("缺少 trl / datasets: pip install trl datasets 後重試(GRPO 為選用階段)")
 
-from common import parse_response
+from common import parse_response_any
 from train.sft import DTYPES, load_causal_lm
 
+# 預設 reward 權重(RLCD 式:對準「校準的機率」,不是對準文字偏好)
+DEFAULT_WEIGHTS = {"format": 1.0, "brier": 1.0, "direction": 0.5, "cover": 0.3}
 
-def reward_components(text, y_home, y_cover=None):
-    """單個 completion 的 reward 分項(dict)。make_reward 與 --reward-audit 共用。
 
-    format:    +1.0  解析出完整機率行
+def reward_components_raw(text, y_home, y_cover=None):
+    """單個 completion 的「未乘權重」reward 分項(dict)。
+
+    format:    1.0  解析出完整機率行(prose 或 typed JSON 皆可)
     brier:     1 - (p_home - y)^2
-    direction: +0.5  預測主/客方向正確
-    cover:     0.3 * (1 - (cover_home - c)^2)
+    direction: 1.0  預測主/客方向正確
+    cover:     1 - (cover_home - c)^2   (沒有 cover 資訊時 0)
+    權重由 make_reward(weights) / run_audit 套用。
     """
     if isinstance(text, (bytes, bytearray)):
         text = text.decode("utf-8", errors="ignore")
-    p = parse_response(str(text))
+    p = parse_response_any(str(text))
     comp = {"format": 0.0, "brier": 0.0, "direction": 0.0, "cover": 0.0}
     if p["format_ok"] and p["p_home"] is not None:
         comp["format"] = 1.0
         comp["brier"] = 1.0 - (p["p_home"] - float(y_home)) ** 2
         pred = p["pred"] or ("主隊" if p["p_home"] >= 0.5 else "客隊")
-        comp["direction"] = 0.5 if pred == ("主隊" if float(y_home) == 1 else "客隊") else 0.0
+        comp["direction"] = 1.0 if pred == ("主隊" if float(y_home) == 1 else "客隊") else 0.0
         if p["cover_home"] is not None and y_cover is not None:
-            comp["cover"] = 0.3 * (1.0 - (p["cover_home"] - float(y_cover)) ** 2)
+            comp["cover"] = 1.0 - (p["cover_home"] - float(y_cover)) ** 2
     return comp
 
 
-def reward_components_soccer(text, y):
-    """足球 1X2 單個 completion 的分項(0=主勝 1=和 2=客勝)。
+def reward_components(text, y_home, y_cover=None):
+    """reward_components_raw × 預設權重(舊 API,行為與過去版本一致)。"""
+    c = reward_components_raw(text, y_home, y_cover)
+    return {k: (c[k] if k in ("format", "brier") else DEFAULT_WEIGHTS[k] * c[k])
+            for k in c}
 
-    format:  +1.0  解析出三結果機率行
-    brier:   1 - Σ(p_i - y_i)²   (多類 Brier 的 1- 形式,範圍 0..1)
-    direction: +0.5  argmax 方向正確
+
+def reward_components_soccer_raw(text, y):
+    """足球 1X2 單個 completion 的未乘權重分項(0=主勝 1=和 2=客勝)。
+
+    format:  1.0   brier: 1 - Σ(p_i - y_i)²   direction: 1.0(argmax 對)
     """
     if isinstance(text, (bytes, bytearray)):
         text = text.decode("utf-8", errors="ignore")
-    p = parse_response(str(text), "soccer")
+    p = parse_response_any(str(text), "soccer")
     comp = {"format": 0.0, "brier": 0.0, "direction": 0.0, "cover": 0.0}
     if p["format_ok"] and p["p_home"] is not None:
         yv = [0.0, 0.0, 0.0]
@@ -98,16 +107,29 @@ def reward_components_soccer(text, y):
         comp["brier"] = 1.0 - (p["p_home"] - yv[0]) ** 2 - (p["p_draw"] - yv[1]) ** 2 \
             - (p["p_away"] - yv[2]) ** 2
         from common import OUTCOME_LABELS
-        comp["direction"] = 0.5 if p["pred"] == OUTCOME_LABELS[int(y)] else 0.0
+        comp["direction"] = 1.0 if p["pred"] == OUTCOME_LABELS[int(y)] else 0.0
     return comp
 
 
-def make_reward():
-    """TRL 1.x reward function(支援 basketball 二結果與 soccer 1X2)。
+def reward_components_soccer(text, y):
+    """reward_components_soccer_raw × 預設權重(舊 API)。"""
+    c = reward_components_soccer_raw(text, y)
+    return {k: (c[k] if k in ("format", "brier") else DEFAULT_WEIGHTS[k] * c[k])
+            for k in c}
+
+
+def make_reward(weights: dict = None):
+    """TRL 1.x reward function(支援 basketball 二結果與 soccer 1X2;prose 與 typed 皆可)。
 
     TRL 以關鍵字呼叫:reward_func(prompts=..., completions=..., completion_ids=...,
     **dataset 額外欄位)→ 回傳 list[float](每個 completion 一個分數)。
+    weights 可調(RLCD 風格:例如把 brier 權重調高,更用力壓校準)。
     """
+    w = dict(DEFAULT_WEIGHTS, **(weights or {}))
+
+    def _score(comp):
+        return (w["format"] * comp["format"] + w["brier"] * comp["brier"]
+                + w["direction"] * comp["direction"] + w["cover"] * comp["cover"])
 
     def reward(prompts=None, completions=None, completion_ids=None,
                outcome_home=None, cover_home=None, outcome=None, sport=None, **_kw):
@@ -121,8 +143,7 @@ def make_reward():
             ys = outcome if isinstance(outcome, list) else [outcome] * len(completions)
             out = []
             for text, y in zip(completions, ys):
-                comp = reward_components_soccer(text, float(y))
-                out.append(comp["format"] + comp["brier"] + comp["direction"] + comp["cover"])
+                out.append(_score(reward_components_soccer_raw(text, float(y))))
             return out
         if outcome_home is None:
             return None
@@ -130,20 +151,21 @@ def make_reward():
         ys = outcome_home if isinstance(outcome_home, list) else [outcome_home]
         cs = cover_home if isinstance(cover_home, list) else ([cover_home] * len(ys))
         for text, y, c in zip(completions, ys, cs):
-            comp = reward_components(text, float(y), float(c) if c is not None else None)
-            out.append(comp["format"] + comp["brier"] + comp["direction"] + comp["cover"])
+            out.append(_score(reward_components_raw(text, float(y),
+                                                     float(c) if c is not None else None)))
         return out
 
     return reward
 
 
-def run_audit(model, tok, rows, n=20, max_new=128):
+def run_audit(model, tok, rows, n=20, max_new=128, weights: dict = None):
     """RL 準備度審計:對 rows 取前 n 個 prompt,greedy 產生 completion,
-    以 reward_components 逐項打分 → 各分項平均值 dict。
+    以 reward_components 逐項打分 → 各分項平均值 dict(reward_mean 用相同權重)。
 
     用途:上 GRPO 前看「格式率/Brier/方向/覆蓋」各差多少;RL 前後各跑一次
     比較,確認 RL 真的把 reward 推上去(而不是只改格式)。
     """
+    w = dict(DEFAULT_WEIGHTS, **(weights or {}))
     rows = rows[:n]
     # prompt 可能是 chat message list(train.jsonl 原格式)或純字串
     convos = [r["prompt"] if isinstance(r["prompt"], list)
@@ -168,17 +190,19 @@ def run_audit(model, tok, rows, n=20, max_new=128):
     sport = "soccer" if rows and rows[0].get("sport") == "soccer" else "basketball"
     for text, r in zip(texts, rows):
         if sport == "soccer":
-            comp = reward_components_soccer(text, float(r["outcome"]))
+            comp = reward_components_soccer_raw(text, float(r["outcome"]))
         else:
-            comp = reward_components(text, float(r["outcome_home"]),
-                                     r.get("cover_home"))
+            comp = reward_components_raw(text, float(r["outcome_home"]),
+                                         r.get("cover_home"))
         for k in tot:
             tot[k] += comp[k]
     k = len(rows)
     return {
         "n": k,
         "sport": sport,
-        "reward_mean": (tot["format"] + tot["brier"] + tot["direction"] + tot["cover"]) / k,
+        "weights": w,
+        "reward_mean": (w["format"] * tot["format"] + w["brier"] * tot["brier"]
+                        + w["direction"] * tot["direction"] + w["cover"] * tot["cover"]) / k,
         "format_rate": tot["format"] / k,
         "brier_mean": tot["brier"] / k,
         "direction_mean": tot["direction"] / k,
@@ -200,6 +224,11 @@ def main() -> None:
     ap.add_argument("--lr", type=float, default=1e-6)
     ap.add_argument("--beta", type=float, default=0.0, help="KL 係數;0=不限制(可試 0.01)")
     ap.add_argument("--temperature", type=float, default=1.0)
+    # reward 權重(RLCD 風格:調高 brier = 更用力壓校準)
+    ap.add_argument("--w-format", type=float, default=DEFAULT_WEIGHTS["format"])
+    ap.add_argument("--w-brier", type=float, default=DEFAULT_WEIGHTS["brier"])
+    ap.add_argument("--w-direction", type=float, default=DEFAULT_WEIGHTS["direction"])
+    ap.add_argument("--w-cover", type=float, default=DEFAULT_WEIGHTS["cover"])
     ap.add_argument("--logging-steps", type=int, default=5)
     ap.add_argument("--epochs", type=int, default=1)
     ap.add_argument("--max-steps", type=int, default=-1)
@@ -211,6 +240,8 @@ def main() -> None:
     ap.add_argument("--audit-max-new", type=int, default=128)
     ap.add_argument("--audit-out", default=None, help="審計結果 JSON 輸出路徑")
     args = ap.parse_args()
+    weights = {"format": args.w_format, "brier": args.w_brier,
+               "direction": args.w_direction, "cover": args.w_cover}
 
     # ---- 資料:GRPO 只需要 prompt + 答案欄位(reward 用)----
     rows = []
@@ -247,7 +278,8 @@ def main() -> None:
         model = model.cuda()
 
     if args.reward_audit:
-        summary = run_audit(model, tok, rows, n=args.audit_n, max_new=args.audit_max_new)
+        summary = run_audit(model, tok, rows, n=args.audit_n, max_new=args.audit_max_new,
+                            weights=weights)
         print(json.dumps(summary, indent=2, ensure_ascii=False))
         if args.audit_out:
             d = os.path.dirname(os.path.abspath(args.audit_out))
@@ -276,7 +308,7 @@ def main() -> None:
     trainer = GRPOTrainer(
         model=model,
         args=cfg,
-        reward_funcs=[make_reward()],
+        reward_funcs=[make_reward(weights)],
         train_dataset=HFDataset.from_list(rows),
         processing_class=tok,
     )
